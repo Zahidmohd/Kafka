@@ -274,33 +274,160 @@ The DescribeTopicPartitions API is used to query metadata about topics and their
 
 ---
 
+### ✅ Stage 6: Implement DescribeTopicPartitions for Unknown Topics
+
+**Status:** COMPLETED
+
+**What it does:**
+- Routes requests to appropriate API handlers based on `request_api_key`
+- Parses DescribeTopicPartitions request body to extract topic names
+- Responds with error code 3 (UNKNOWN_TOPIC_OR_PARTITION) for unknown topics
+- Uses Response Header v1 (includes TAG_BUFFER)
+
+**Purpose:**
+This stage implements the actual request handling for the DescribeTopicPartitions API, allowing clients to query topic metadata (though all topics are currently treated as unknown).
+
+**Request Parsing:**
+The DescribeTopicPartitions request body contains:
+```
+Field           Type            Description
+-----           ----            -----------
+topics          COMPACT_ARRAY   Array of topics to query
+  └─ topic_name STRING          The topic name
+  └─ TAG_BUFFER TAGGED_FIELDS   Optional fields
+TAG_BUFFER      TAGGED_FIELDS   Optional fields
+```
+
+**Response Header v1 vs v0:**
+- **v0**: Only `correlation_id` (4 bytes)
+- **v1**: `correlation_id` (4 bytes) + `TAG_BUFFER` (1 byte)
+
+**DescribeTopicPartitions Response Structure:**
+```
+00 00 00 2f  // message_size:                 47 bytes
+ab cd ef 12  // correlation_id:               (from request)
+00           // TAG_BUFFER:                   empty (header v1)
+00 00 00 00  // throttle_time_ms:             0
+02           // topics array:                 1 element
+00 03        // error_code:                   3 (UNKNOWN_TOPIC_OR_PARTITION)
+04           // topic_name length:            3+1 (compact string)
+66 6f 6f     // topic_name:                   "foo"
+00 00 00 00  // topic_id:                     00000000-0000-0000-
+00 00 00 00  //                               0000-000000000000
+00 00 00 00  //                               (16 bytes, all zeros)
+00 00 00 00  //
+00           // is_internal:                  false
+01           // partitions array:             0 elements (empty)
+00 00 00 00  // topic_authorized_operations:  0
+00           // TAG_BUFFER:                   empty
+ff           // next_cursor:                  -1 (null)
+00           // TAG_BUFFER:                   empty
+```
+
+**Key Fields Explained:**
+
+1. **error_code = 3**: UNKNOWN_TOPIC_OR_PARTITION
+   - Indicates the requested topic doesn't exist
+   - Client will know to create the topic or handle the error
+
+2. **topic_id = all zeros**: 
+   - UUID format: 00000000-0000-0000-0000-000000000000
+   - Represents a null/invalid topic ID
+
+3. **is_internal = false**:
+   - Kafka has internal topics (e.g., `__consumer_offsets`)
+   - Our topics are not internal
+
+4. **partitions = empty**:
+   - COMPACT_ARRAY with 0 elements (encoded as 1)
+   - No partition data since topic doesn't exist
+
+5. **next_cursor = -1**:
+   - Used for pagination in responses with many results
+   - -1 means null (no more pages)
+
+**Code Architecture Changes:**
+- **Refactored to handler pattern**: Separate functions for each API
+- `handleApiVersions()`: Handles API key 18
+- `handleDescribeTopicPartitions()`: Handles API key 75
+- Main connection handler routes requests based on `request_api_key`
+
+**Parsing COMPACT_STRING:**
+```javascript
+// COMPACT_STRING format: length_prefix (n+1) + bytes
+const nameLength = data.readUInt8(offset) - 1;
+offset += 1;
+const name = data.toString('utf8', offset, offset + nameLength);
+```
+
+**Parsing COMPACT_ARRAY:**
+```javascript
+// COMPACT_ARRAY format: length_prefix (n+1) + elements
+const arrayLength = data.readUInt8(offset) - 1;
+offset += 1;
+// Now read 'arrayLength' elements
+```
+
+**Key Concepts:**
+- **API Routing**: Different request_api_key values route to different handlers
+- **Request Body Parsing**: Extracting structured data from binary protocol
+- **Response Header Versioning**: Different response header versions for different APIs
+- **Error Codes**: Returning appropriate errors for unknown resources
+- **UUID Encoding**: 16-byte binary UUID format
+- **COMPACT_STRING**: Variable-length strings with length prefix
+- **NULLABLE Fields**: Using special values (-1, all zeros) to represent null
+
+**Code Highlights:**
+```javascript
+// API routing based on request_api_key
+if (requestApiKey === 18) {
+  handleApiVersions(connection, requestApiVersion, correlationId);
+} else if (requestApiKey === 75) {
+  handleDescribeTopicPartitions(connection, data, correlationId);
+}
+
+// Parse COMPACT_STRING for topic name
+const topicNameLength = data.readUInt8(offset) - 1;
+offset += 1;
+const topicName = data.toString('utf8', offset, offset + topicNameLength);
+
+// Write UUID (all zeros for unknown topic)
+responseBody.fill(0, bodyOffset, bodyOffset + 16);
+
+// Response Header v1 includes TAG_BUFFER
+response.writeUInt8(0, 8); // TAG_BUFFER after correlation_id
+```
+
+---
+
 ## 🔮 Future Stages (To Be Implemented)
 
-### Stage 6: Implement DescribeTopicPartitions Request Handling
-- Actually handle DescribeTopicPartitions requests
-- Return metadata about topics and partitions
+### Stage 7: Handle Known Topics
+- Store topic metadata
+- Return actual topic information for known topics
+- Create topics dynamically
 
-### Stage 7: Topic Management
+### Stage 8: Topic Management  
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 8: Produce API
+### Stage 9: Produce API
 - Accept messages from producers
 - Write events to partitions
 - Acknowledge successful writes
 
-### Stage 9: Fetch API
+### Stage 10: Fetch API
 - Allow consumers to read messages
 - Support offset-based reading
 - Implement batching
 
-### Stage 10: Message Storage
+### Stage 11: Message Storage
 - Persist messages to disk
 - Implement log segments
 - Support for log compaction
 
-### Stage 11: Replication (Advanced)
+### Stage 12: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication
@@ -324,42 +451,53 @@ The DescribeTopicPartitions API is used to query metadata about topics and their
 │  Client Request (Binary)                        │
 │  ┌───────────────────────────────────────┐     │
 │  │ message_size                          │     │
-│  │ request_api_key                       │     │
+│  │ request_api_key     (18 or 75)        │     │
 │  │ request_api_version                   │     │
 │  │ correlation_id                        │     │
-│  │ ... (rest of header and body)         │     │
+│  │ client_id, TAG_BUFFER (header)        │     │
+│  │ ... (request body)                    │     │
 │  └───────────────────────────────────────┘     │
 │                                                 │
 └─────────────────────────────────────────────────┘
                       │
                       ▼
 ┌─────────────────────────────────────────────────┐
-│         Request Parser & Handler                │
+│         Request Parser & Router                 │
 │  - Extract header fields                        │
-│  - Validate API version                         │
-│  - Route to appropriate handler                 │
+│  - Parse request_api_key                        │
+│  - Route based on API key                       │
 └─────────────────────────────────────────────────┘
                       │
-                      ▼
-┌─────────────────────────────────────────────────┐
-│              API Handlers                       │
-│  - ApiVersions (implemented)                    │
-│  - Produce (future)                             │
-│  - Fetch (future)                               │
-│  - CreateTopics (future)                        │
-└─────────────────────────────────────────────────┘
-                      │
+            ┌─────────┴─────────┐
+            ▼                   ▼
+┌─────────────────┐   ┌──────────────────────────┐
+│ API Key 18      │   │ API Key 75               │
+│ ApiVersions     │   │ DescribeTopicPartitions  │
+│ Handler         │   │ Handler                  │
+│                 │   │                          │
+│ - Validate ver  │   │ - Parse request body     │
+│ - Return list   │   │ - Extract topic names    │
+│   of supported  │   │ - Return topic metadata  │
+│   APIs          │   │   (or error if unknown)  │
+└─────────────────┘   └──────────────────────────┘
+            │                   │
+            └─────────┬─────────┘
                       ▼
 ┌─────────────────────────────────────────────────┐
 │  Broker Response (Binary)                       │
 │  ┌───────────────────────────────────────┐     │
 │  │ message_size                          │     │
 │  │ correlation_id                        │     │
-│  │ error_code                            │     │
+│  │ TAG_BUFFER (header v1 for API 75)     │     │
+│  │ error_code or response data           │     │
 │  │ ... (response body)                   │     │
 │  └───────────────────────────────────────┘     │
 └─────────────────────────────────────────────────┘
 ```
+
+**Supported APIs:**
+- **API 18 (ApiVersions)**: Returns list of supported APIs
+- **API 75 (DescribeTopicPartitions)**: Returns topic metadata (currently unknown topics only)
 
 ---
 
@@ -473,25 +611,48 @@ The CodeCrafters platform provides automated tests that verify:
    - Reading integers from specific byte offsets
    - Understanding byte order (big-endian vs little-endian)
    - Working with Node.js Buffers
+   - Parsing variable-length strings (COMPACT_STRING)
+   - Parsing arrays (COMPACT_ARRAY)
 
 3. **Kafka Wire Protocol**
    - Message structure (size, header, body)
-   - Request header parsing
-   - Response construction
+   - Request header parsing (v0, v1, v2)
+   - Response construction with different header versions
+   - Request body parsing
 
 4. **API Versioning**
    - How protocols evolve over time
    - Version negotiation between client and server
    - Error handling for unsupported versions
+   - Different APIs can have different version ranges
 
 5. **Protocol Data Types**
-   - INT16, INT32 encoding
-   - COMPACT_ARRAY special encoding
+   - INT8, INT16, INT32 encoding
+   - COMPACT_ARRAY special encoding (n+1 for n elements)
+   - COMPACT_STRING encoding (length+1 prefix + bytes)
    - TAG_BUFFER for extensibility
+   - UUID format (16 bytes)
+   - NULLABLE types (using special values like -1)
+   - BOOLEAN encoding
 
 6. **Error Handling**
    - Returning appropriate error codes
    - Distinguishing between different error scenarios
+   - Error code 3: UNKNOWN_TOPIC_OR_PARTITION
+   - Error code 35: UNSUPPORTED_VERSION
+
+7. **API Routing and Architecture**
+   - Routing requests based on `request_api_key`
+   - Separating handlers for different APIs
+   - Code organization with handler functions
+   - Different response header versions for different APIs
+
+8. **Kafka Concepts**
+   - Topics and partitions (basic understanding)
+   - Topic metadata (name, ID, partitions)
+   - Internal vs. external topics
+   - Unknown topic handling
+   - Topic UUIDs and identification
 
 ---
 
@@ -516,5 +677,5 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 5 - DescribeTopicPartitions API Advertised
+**Current Stage:** Stage 6 - DescribeTopicPartitions Implementation for Unknown Topics Complete
 

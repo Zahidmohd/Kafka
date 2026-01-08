@@ -76,30 +76,54 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
 // Handler for DescribeTopicPartitions API (API key 75)
 function handleDescribeTopicPartitions(connection, data, correlationId) {
   console.log("Handling DescribeTopicPartitions request");
+  console.log("Full request hex:", data.toString('hex'));
   
   // Parse request body to extract topic names
-  // After the request header, we need to skip the client_id and TAG_BUFFER
-  // The structure after correlation_id (offset 8) is:
-  //   - 4 bytes: correlation_id (already at offset 8)
-  //   - Variable: client_id (NULLABLE_STRING)
-  //   - 1 byte: TAG_BUFFER (for header)
-  //   - Then body starts with topics (COMPACT_ARRAY)
+  // Request Header v2 structure:
+  //   Offset 0: message_size (4 bytes)
+  //   Offset 4: request_api_key (2 bytes)
+  //   Offset 6: request_api_version (2 bytes)
+  //   Offset 8: correlation_id (4 bytes)
+  //   Offset 12: client_id (COMPACT_NULLABLE_STRING)
+  //   Offset X: TAG_BUFFER (1 byte minimum)
+  //   Then body starts
   
   let offset = 12; // Start after message_size, api_key, api_version, correlation_id
   
-  // Skip client_id (NULLABLE_STRING in compact form)
-  // COMPACT_STRING: first byte is length+1, 0 means null
-  const clientIdLength = data.readUInt8(offset) - 1;
+  console.log("Starting offset:", offset);
+  console.log("Bytes at offset 12:", data.toString('hex', 12, 20));
+  
+  // Skip client_id (COMPACT_NULLABLE_STRING)
+  // COMPACT_NULLABLE_STRING: 0 = null, otherwise length+1
+  const clientIdLengthByte = data.readUInt8(offset);
+  console.log("Client ID length byte:", clientIdLengthByte);
   offset += 1;
-  if (clientIdLength > 0) {
+  
+  if (clientIdLengthByte > 0) {
+    const clientIdLength = clientIdLengthByte - 1;
+    const clientId = data.toString('utf8', offset, offset + clientIdLength);
+    console.log("Client ID:", clientId, "length:", clientIdLength);
     offset += clientIdLength;
+  } else {
+    console.log("Client ID is null");
   }
   
-  // Skip TAG_BUFFER from header
+  // Skip TAG_BUFFER from header (at least 1 byte)
+  const headerTagBufferLength = data.readUInt8(offset);
+  console.log("Header TAG_BUFFER length:", headerTagBufferLength);
   offset += 1;
+  if (headerTagBufferLength > 0) {
+    // Skip additional tag buffer bytes if present
+    // For now, assuming it's just 0 (empty)
+  }
+  
+  console.log("Body starts at offset:", offset);
+  console.log("Bytes at body start:", data.toString('hex', offset, offset + 20));
   
   // Now we're at the body: topics (COMPACT_ARRAY)
-  const topicsArrayLength = data.readUInt8(offset) - 1; // Compact encoding: n+1
+  const topicsArrayLengthByte = data.readUInt8(offset);
+  console.log("Topics array length byte:", topicsArrayLengthByte);
+  const topicsArrayLength = topicsArrayLengthByte - 1; // Compact encoding: n+1
   offset += 1;
   
   console.log("Number of topics requested:", topicsArrayLength);
@@ -108,7 +132,9 @@ function handleDescribeTopicPartitions(connection, data, correlationId) {
   let topicName = "";
   if (topicsArrayLength > 0) {
     // Read topic name (COMPACT_STRING)
-    const topicNameLength = data.readUInt8(offset) - 1;
+    const topicNameLengthByte = data.readUInt8(offset);
+    const topicNameLength = topicNameLengthByte - 1;
+    console.log("Topic name length byte:", topicNameLengthByte, "actual length:", topicNameLength);
     offset += 1;
     topicName = data.toString('utf8', offset, offset + topicNameLength);
     console.log("Requested topic:", topicName);
