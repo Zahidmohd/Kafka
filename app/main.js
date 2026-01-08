@@ -79,43 +79,39 @@ function handleDescribeTopicPartitions(connection, data, correlationId) {
   console.log("Full request hex:", data.toString('hex'));
   
   // Parse request body to extract topic names
-  // Request Header v2 structure:
+  // DescribeTopicPartitions v0 uses older header format (not fully flexible/compact)
+  // Request structure:
   //   Offset 0: message_size (4 bytes)
   //   Offset 4: request_api_key (2 bytes)
   //   Offset 6: request_api_version (2 bytes)
   //   Offset 8: correlation_id (4 bytes)
-  //   Offset 12: client_id (COMPACT_NULLABLE_STRING)
-  //   Offset X: TAG_BUFFER (1 byte minimum)
+  //   Offset 12: client_id (NULLABLE_STRING - INT16 length + bytes)
+  //   Offset X: TAG_BUFFER (1 byte)
   //   Then body starts
   
   let offset = 12; // Start after message_size, api_key, api_version, correlation_id
   
   console.log("Starting offset:", offset);
-  console.log("Bytes at offset 12:", data.toString('hex', 12, 20));
+  console.log("Bytes at offset 12:", data.toString('hex', 12, 24));
   
-  // Skip client_id (COMPACT_NULLABLE_STRING)
-  // COMPACT_NULLABLE_STRING: 0 = null, otherwise length+1
-  const clientIdLengthByte = data.readUInt8(offset);
-  console.log("Client ID length byte:", clientIdLengthByte);
-  offset += 1;
+  // Skip client_id (NULLABLE_STRING - uses INT16 length, not compact!)
+  // INT16 length: -1 (0xFFFF) = null, otherwise read that many bytes
+  const clientIdLength = data.readInt16BE(offset);
+  console.log("Client ID length (INT16):", clientIdLength);
+  offset += 2;
   
-  if (clientIdLengthByte > 0) {
-    const clientIdLength = clientIdLengthByte - 1;
+  if (clientIdLength >= 0) {
     const clientId = data.toString('utf8', offset, offset + clientIdLength);
-    console.log("Client ID:", clientId, "length:", clientIdLength);
+    console.log("Client ID:", clientId);
     offset += clientIdLength;
   } else {
     console.log("Client ID is null");
   }
   
-  // Skip TAG_BUFFER from header (at least 1 byte)
+  // Skip TAG_BUFFER from header (1 byte)
   const headerTagBufferLength = data.readUInt8(offset);
-  console.log("Header TAG_BUFFER length:", headerTagBufferLength);
+  console.log("Header TAG_BUFFER:", headerTagBufferLength);
   offset += 1;
-  if (headerTagBufferLength > 0) {
-    // Skip additional tag buffer bytes if present
-    // For now, assuming it's just 0 (empty)
-  }
   
   console.log("Body starts at offset:", offset);
   console.log("Bytes at body start:", data.toString('hex', offset, offset + 20));
