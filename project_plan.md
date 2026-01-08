@@ -1360,37 +1360,212 @@ Stage 16 will implement validation logic to check if topics/partitions actually 
 
 ---
 
+### ✅ Stage 16: Produce Success Responses
+
+**Status:** COMPLETED
+
+**What it does:**
+- Validates topics exist by reading cluster metadata log
+- Validates partitions exist for the requested topic
+- Returns error_code 0 (NO_ERROR) for valid topics/partitions
+- Returns error_code 3 (UNKNOWN_TOPIC_OR_PARTITION) for invalid ones
+- Sets proper offset values for success responses
+- Still doesn't write messages to disk (that's Stage 17)
+
+**Purpose:**
+This stage implements topic and partition validation for Produce requests, allowing the broker to distinguish between valid and invalid produce operations. This is critical for providing proper feedback to producers.
+
+**Validation Logic:**
+
+```javascript
+// Step 1: Validate topic exists
+const topicMetadata = findTopicInLog(topicName);
+
+if (!topicMetadata || !topicMetadata.found) {
+  // Topic doesn't exist - return error code 3
+  partition.errorCode = 3;
+  partition.baseOffset = -1n;
+  partition.logAppendTimeMs = -1n;
+  partition.logStartOffset = -1n;
+} else {
+  // Step 2: Validate partition exists
+  const partitionMetadata = topicMetadata.partitions.find(
+    p => p.partitionIndex === partition.index
+  );
+  
+  if (!partitionMetadata) {
+    // Partition doesn't exist - return error code 3
+    partition.errorCode = 3;
+    partition.baseOffset = -1n;
+    partition.logAppendTimeMs = -1n;
+    partition.logStartOffset = -1n;
+  } else {
+    // Valid topic and partition - return success
+    partition.errorCode = 0;  // NO_ERROR
+    partition.baseOffset = 0n;  // First record
+    partition.logAppendTimeMs = -1n;  // Latest timestamp
+    partition.logStartOffset = 0n;  // Start of log
+  }
+}
+```
+
+**Validation Order:**
+1. **Topic Validation**: Check if topic exists in `__cluster_metadata`
+2. **Partition Validation**: Check if partition exists within that topic
+3. **Response Building**: Use validated values in response
+
+**Success Response Fields:**
+```
+For a valid topic/partition:
+├─ error_code: 0 (NO_ERROR)
+├─ base_offset: 0 (signifies first record in partition)
+├─ log_append_time_ms: -1 (signifies latest timestamp)
+└─ log_start_offset: 0 (start of the log)
+```
+
+**Error Response Fields:**
+```
+For invalid topic/partition:
+├─ error_code: 3 (UNKNOWN_TOPIC_OR_PARTITION)
+├─ base_offset: -1 (invalid)
+├─ log_append_time_ms: -1 (invalid)
+└─ log_start_offset: -1 (invalid)
+```
+
+**Cluster Metadata Lookup:**
+```javascript
+// Uses existing findTopicInLog function
+// Reads: /tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log
+// Searches for: TOPIC_RECORD with matching topic name
+// Extracts: Topic UUID and partition list
+// Returns: { found: true, topicName, topicUUID, partitions: [...] }
+```
+
+**Partition Validation:**
+```javascript
+// Check if requested partition index exists in metadata
+const partitionMetadata = topicMetadata.partitions.find(
+  p => p.partitionIndex === partition.index
+);
+
+// If found, partition is valid
+// If not found, return UNKNOWN_TOPIC_OR_PARTITION error
+```
+
+**Example Flow:**
+
+**Scenario 1: Valid Topic & Partition**
+```
+Producer → Produce(topic="events", partition=0)
+Broker → Lookup "events" in metadata ✓ Found
+Broker → Check partition 0 exists ✓ Found
+Broker → Response(error_code=0, base_offset=0)
+Producer ← Success! Message accepted (not written yet)
+```
+
+**Scenario 2: Invalid Topic**
+```
+Producer → Produce(topic="unknown", partition=0)
+Broker → Lookup "unknown" in metadata ✗ Not found
+Broker → Response(error_code=3, base_offset=-1)
+Producer ← Error! Topic doesn't exist
+```
+
+**Scenario 3: Valid Topic, Invalid Partition**
+```
+Producer → Produce(topic="events", partition=99)
+Broker → Lookup "events" in metadata ✓ Found
+Broker → Check partition 99 exists ✗ Not found
+Broker → Response(error_code=3, base_offset=-1)
+Producer ← Error! Partition doesn't exist
+```
+
+**Key Concepts:**
+- **Metadata-driven validation**: Uses cluster metadata as source of truth
+- **Early validation**: Check before attempting any writes
+- **Consistent error codes**: Same error (3) for both invalid topics and partitions
+- **BigInt offsets**: Use JavaScript BigInt for 64-bit offset values
+- **Reuse existing code**: Leverages `findTopicInLog` from DescribeTopicPartitions
+
+**Implementation Highlights:**
+```javascript
+// Store validation results in partition object
+for (const partition of topic.partitions) {
+  const partitionMetadata = topicMetadata.partitions.find(
+    p => p.partitionIndex === partition.index
+  );
+  
+  if (partitionMetadata) {
+    partition.errorCode = 0;  // Success
+    partition.baseOffset = 0n;
+    partition.logAppendTimeMs = -1n;
+    partition.logStartOffset = 0n;
+  } else {
+    partition.errorCode = 3;  // Error
+    partition.baseOffset = -1n;
+    partition.logAppendTimeMs = -1n;
+    partition.logStartOffset = -1n;
+  }
+}
+
+// Use stored values in response
+response.writeInt16BE(partition.errorCode, offset);
+response.writeBigInt64BE(partition.baseOffset, offset + 2);
+response.writeBigInt64BE(partition.logAppendTimeMs, offset + 10);
+response.writeBigInt64BE(partition.logStartOffset, offset + 18);
+```
+
+**What We're NOT Doing (Yet):**
+- ❌ Writing messages to disk
+- ❌ Updating partition offsets
+- ❌ Persisting record batches
+- ❌ File I/O operations
+- ❌ Transaction handling
+
+**What's Next:**
+Stage 17 will implement the actual message writing:
+- Parse record batches from Produce request
+- Write to partition log files
+- Update offsets after successful writes
+- Handle file creation and appending
+- Maintain log file integrity
+
+---
+
 ## 🔮 Future Stages (To Be Implemented)
 
-### Stage 16: Produce Success Response
-- Validate topics and partitions exist
-- Return success responses (error_code 0) for valid topics
-- Still no actual writing to disk yet
-- Implement proper offset tracking
+### Stage 17: Writing Messages to Disk
 
 ### Stage 17: Writing Messages to Disk
-- Write record batches to partition log files
-- Update log file offsets
-- Maintain log integrity
-- Handle file rotation
+- Parse record batches from Produce requests
+- Write to partition log files
+- Update offsets after writes
+- Create partition directories if needed
+- Append to existing log files
 
-### Stage 18: Advanced Fetch Features
+### Stage 18: Advanced Produce Features
+- Handle idempotent producers
+- Implement transaction support
+- Optimize batch writes
+- Handle producer retries
+
+### Stage 19: Advanced Fetch Features
 - Handle fetch offsets (start reading from specific position)
 - Support max bytes limit
 - Handle multiple partitions
 - Optimize large message handling
 
-### Stage 19: Topic Management  
+### Stage 20: Topic Management  
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 20: Message Compaction
+### Stage 21: Message Compaction
 - Support for log compaction
 - Implement cleanup policies
 - Optimize storage
 
-### Stage 21: Replication (Advanced)
+### Stage 22: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication

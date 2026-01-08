@@ -1264,7 +1264,7 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
     // Look up topic in cluster metadata
     const topicMetadata = findTopicInLog(topic.name);
     
-    if (!topicMetadata || !topicMetadata.found) {
+    if (!topicMetadata) {
       console.log(`  ✗ Topic "${topic.name}" not found`);
       // Mark all partitions as invalid
       for (const partition of topic.partitions) {
