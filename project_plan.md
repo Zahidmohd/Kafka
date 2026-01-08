@@ -1004,22 +1004,22 @@ responseBody.writeInt16BE(errorCode, offset);
 - Handle offsets correctly
 - Parse and encode Kafka record format
 
-### Stage 13: Topic Management  
+### Stage 14: Topic Management  
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 14: Produce API
+### Stage 15: Produce API
 - Accept messages from producers
 - Write events to partitions
 - Acknowledge successful writes
 
-### Stage 15: Message Storage
+### Stage 16: Message Storage
 - Persist messages to disk
 - Implement log segments
 - Support for log compaction
 
-### Stage 16: Replication (Advanced)
+### Stage 17: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication
@@ -1288,5 +1288,5 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 11 - Fetch API for Unknown Topic Complete
+**Current Stage:** Stage 12 - Fetch API for Known Topic (No Messages) Complete
 

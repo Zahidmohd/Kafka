@@ -8,6 +8,74 @@ console.log("Logs from your program will appear here!");
 // Store topic metadata in memory (cache)
 const topicsMetadata = new Map();
 
+// Helper: Read messages from partition log file
+function readPartitionLog(topicName, partitionId) {
+  const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partitionId}`;
+  const logFile = `${partitionDir}/00000000000000000000.log`;
+  
+  console.log(`Reading partition log: ${logFile}`);
+  
+  try {
+    if (!fs.existsSync(logFile)) {
+      console.log(`Log file not found: ${logFile}`);
+      return null;
+    }
+    
+    const logData = fs.readFileSync(logFile);
+    console.log(`Read ${logData.length} bytes from partition log`);
+    
+    if (logData.length === 0) {
+      console.log("Log file is empty");
+      return null;
+    }
+    
+    // Kafka log format:
+    // Each entry: baseOffset (8 bytes) + batchLength (4 bytes) + batchData
+    // We'll read all record batches and return them
+    const recordBatches = [];
+    let offset = 0;
+    
+    while (offset < logData.length) {
+      if (offset + 12 > logData.length) {
+        break; // Not enough data for header
+      }
+      
+      const baseOffset = logData.readBigInt64BE(offset);
+      offset += 8;
+      
+      const batchLength = logData.readInt32BE(offset);
+      offset += 4;
+      
+      if (batchLength < 0 || offset + batchLength > logData.length) {
+        console.log(`Invalid batch length: ${batchLength}`);
+        break;
+      }
+      
+      // Read the entire record batch (without the baseOffset and batchLength prefix)
+      const batchData = logData.slice(offset, offset + batchLength);
+      recordBatches.push(batchData);
+      
+      console.log(`  Record batch: baseOffset=${baseOffset}, length=${batchLength}`);
+      
+      offset += batchLength;
+    }
+    
+    if (recordBatches.length === 0) {
+      console.log("No record batches found");
+      return null;
+    }
+    
+    // Concatenate all record batches
+    const allBatches = Buffer.concat(recordBatches);
+    console.log(`Total record batches: ${recordBatches.length}, total size: ${allBatches.length} bytes`);
+    
+    return allBatches;
+  } catch (err) {
+    console.log("Error reading partition log:", err.message);
+    return null;
+  }
+}
+
 // Helper: Find topic by UUID
 function findTopicByUUID(topicUUID) {
   // Check cache first
@@ -916,6 +984,15 @@ function handleFetch(connection, requestApiVersion, correlationId, data) {
   connection.write(response);
 }
 
+// Helper: Calculate varint byte length
+function varintByteLength(value) {
+  if (value < 128) return 1;
+  if (value < 16384) return 2;
+  if (value < 2097152) return 3;
+  if (value < 268435456) return 4;
+  return 5;
+}
+
 // Build Fetch response body
 function buildFetchResponseBody(requestedTopics) {
   // Look up metadata for each topic by UUID
@@ -925,10 +1002,17 @@ function buildFetchResponseBody(requestedTopics) {
     
     console.log(`Topic ${topic.topicId.toString('hex').substring(0, 16)}... exists: ${exists}`);
     
+    // Read partition log if topic exists
+    let records = null;
+    if (exists && metadata) {
+      records = readPartitionLog(metadata.name, 0); // Read partition 0
+    }
+    
     return {
       topicId: topic.topicId,
       metadata: metadata,
-      exists: exists
+      exists: exists,
+      records: records
     };
   });
   
@@ -945,7 +1029,17 @@ function buildFetchResponseBody(requestedTopics) {
     bodySize += 8; // log_start_offset (INT64)
     bodySize += 1; // aborted_transactions (COMPACT_ARRAY - empty)
     bodySize += 4; // preferred_read_replica (INT32)
-    bodySize += 1; // records (COMPACT_BYTES - empty/null)
+    
+    // records (COMPACT_BYTES)
+    if (topic.records && topic.records.length > 0) {
+      // COMPACT_BYTES: varint length + data
+      const recordsLength = topic.records.length;
+      const lengthBytes = varintByteLength(recordsLength + 1); // +1 for compact encoding
+      bodySize += lengthBytes + recordsLength;
+    } else {
+      bodySize += 1; // null/empty (0)
+    }
+    
     bodySize += 1; // TAG_BUFFER
     bodySize += 1; // TAG_BUFFER (for topic)
   }
@@ -1009,9 +1103,31 @@ function buildFetchResponseBody(requestedTopics) {
     responseBody.writeInt32BE(-1, offset);
     offset += 4;
     
-    // records (COMPACT_BYTES): null (-1 in compact encoding = 0)
-    responseBody.writeUInt8(0, offset);
-    offset += 1;
+    // records (COMPACT_BYTES)
+    if (topic.records && topic.records.length > 0) {
+      // COMPACT_BYTES: unsigned varint (length + 1), then data
+      const recordsLength = topic.records.length;
+      let len = recordsLength + 1; // Compact encoding: actual length + 1
+      
+      // Write unsigned varint
+      while (len >= 128) {
+        responseBody.writeUInt8((len & 0x7F) | 0x80, offset);
+        offset += 1;
+        len >>>= 7;
+      }
+      responseBody.writeUInt8(len & 0x7F, offset);
+      offset += 1;
+      
+      // Write the actual record batch data
+      topic.records.copy(responseBody, offset);
+      offset += topic.records.length;
+      
+      console.log(`  Wrote ${topic.records.length} bytes of records`);
+    } else {
+      // null/empty records: 0 in compact encoding
+      responseBody.writeUInt8(0, offset);
+      offset += 1;
+    }
     
     // TAG_BUFFER (empty)
     responseBody.writeUInt8(0, offset);
