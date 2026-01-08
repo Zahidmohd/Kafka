@@ -38,29 +38,9 @@ function findTopicInLog(topicName) {
     
     console.log('✓ Topic UUID:', topicUUID.toString('hex'));
     
-    // Search for partition data by finding the UUID again in the remaining log
+    // Search for ALL partition data by finding ALL occurrences of the UUID in the log
     const searchStart = topicNameIndex + topicNameBuffer.length + 16;
     const remainingLogFile = logData.subarray(searchStart);
-    const partitionIndex = remainingLogFile.indexOf(topicUUID);
-    
-    if (partitionIndex === -1) {
-      console.log('No partition data found for topic');
-      return {
-        name: topicName,
-        id: topicUUID,
-        partitions: []
-      };
-    }
-    
-    console.log('✓ Found partition data at offset:', partitionIndex);
-    
-    // Parse partition data
-    const partitions = [];
-    let offset = partitionIndex;
-    
-    // Partition index is 4 bytes before the UUID
-    const partitionId = remainingLogFile.readInt32BE(offset - 4);
-    offset += 16; // Skip UUID
     
     // Helper: read compact array (length + 1 encoding)
     function readCompactArray(buffer, pos) {
@@ -74,39 +54,75 @@ function findTopicInLog(topicName) {
       return { values, nextOffset: pos };
     }
     
-    // Read replica nodes (compact array of 4-byte broker IDs)
-    const replicaNodes = readCompactArray(remainingLogFile, offset);
-    offset = replicaNodes.nextOffset;
+    // Find all occurrences of the UUID (each represents a partition)
+    const partitions = [];
+    let searchOffset = 0;
     
-    // Read ISR nodes (compact array of 4-byte broker IDs)
-    const isrNodes = readCompactArray(remainingLogFile, offset);
-    offset = isrNodes.nextOffset;
+    while (true) {
+      // Search for next occurrence of UUID
+      const partitionIndex = remainingLogFile.indexOf(topicUUID, searchOffset);
+      
+      if (partitionIndex === -1) {
+        break; // No more partitions found
+      }
+      
+      console.log(`✓ Found partition data at offset: ${partitionIndex}`);
+      
+      try {
+        let offset = partitionIndex;
+        
+        // Partition index is 4 bytes before the UUID
+        const partitionId = remainingLogFile.readInt32BE(offset - 4);
+        offset += 16; // Skip UUID
+        
+        // Read replica nodes (compact array of 4-byte broker IDs)
+        const replicaNodes = readCompactArray(remainingLogFile, offset);
+        offset = replicaNodes.nextOffset;
+        
+        // Read ISR nodes (compact array of 4-byte broker IDs)
+        const isrNodes = readCompactArray(remainingLogFile, offset);
+        offset = isrNodes.nextOffset;
+        
+        // Read removing replicas (compact array of 4-byte broker IDs)
+        const removingReplicas = readCompactArray(remainingLogFile, offset);
+        offset = removingReplicas.nextOffset;
+        
+        // Read adding replicas (compact array of 4-byte broker IDs)
+        const addingReplicas = readCompactArray(remainingLogFile, offset);
+        offset = addingReplicas.nextOffset;
+        
+        // Leader ID (4 bytes)
+        const leaderId = remainingLogFile.readInt32BE(offset);
+        offset += 4;
+        
+        // Leader epoch (4 bytes)
+        const leaderEpoch = remainingLogFile.readInt32BE(offset);
+        offset += 4;
+        
+        partitions.push({
+          partitionId: partitionId,
+          leader: leaderId,
+          replicas: replicaNodes.values,
+          isr: isrNodes.values,
+          leaderEpoch: leaderEpoch
+        });
+        
+        console.log(`✓ Partition ${partitionId}: leader=${leaderId}, replicas=[${replicaNodes.values}], isr=[${isrNodes.values}]`);
+        
+        // Move search offset past this UUID to find next partition
+        searchOffset = partitionIndex + 16;
+      } catch (err) {
+        console.log(`Error parsing partition at offset ${partitionIndex}:`, err.message);
+        // Move past this occurrence and continue searching
+        searchOffset = partitionIndex + 16;
+      }
+    }
     
-    // Read removing replicas (compact array of 4-byte broker IDs)
-    const removingReplicas = readCompactArray(remainingLogFile, offset);
-    offset = removingReplicas.nextOffset;
-    
-    // Read adding replicas (compact array of 4-byte broker IDs)
-    const addingReplicas = readCompactArray(remainingLogFile, offset);
-    offset = addingReplicas.nextOffset;
-    
-    // Leader ID (4 bytes)
-    const leaderId = remainingLogFile.readInt32BE(offset);
-    offset += 4;
-    
-    // Leader epoch (4 bytes)
-    const leaderEpoch = remainingLogFile.readInt32BE(offset);
-    offset += 4;
-    
-    partitions.push({
-      partitionId: partitionId,
-      leader: leaderId,
-      replicas: replicaNodes.values,
-      isr: isrNodes.values,
-      leaderEpoch: leaderEpoch
-    });
-    
-    console.log(`✓ Partition ${partitionId}: leader=${leaderId}, replicas=[${replicaNodes.values}], isr=[${isrNodes.values}]`);
+    if (partitions.length === 0) {
+      console.log('No partition data found for topic');
+    } else {
+      console.log(`✓ Found ${partitions.length} partition(s) for topic "${topicName}"`);
+    }
     
     const metadata = {
       name: topicName,
