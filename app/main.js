@@ -20,7 +20,6 @@ function parseClusterMetadata() {
     
     const logData = fs.readFileSync(logPath);
     console.log("Reading cluster metadata log, size:", logData.length, "bytes");
-    console.log("First 100 bytes:", logData.toString('hex', 0, 100));
     
     // Parse Kafka log format
     // Kafka log format consists of records with specific structure
@@ -42,10 +41,8 @@ function parseClusterMetadata() {
         const batchLength = logData.readInt32BE(offset);
         offset += 4;
         
-        console.log(`Record ${recordCount}: baseOffset=${baseOffset}, batchLength=${batchLength}`);
-        
         if (batchLength < 0 || batchLength > logData.length - offset) {
-          console.log("Invalid batch length, skipping");
+          console.log("Invalid batch length, stopping");
           break;
         }
         
@@ -56,17 +53,21 @@ function parseClusterMetadata() {
         offset += batchLength;
         recordCount++;
         
-        if (recordCount > 100) {
-          console.log("Stopping after 100 records to avoid infinite loop");
+        if (recordCount > 200) {
+          console.log("Stopping after 200 records to avoid infinite loop");
           break;
         }
       } catch (err) {
-        console.log("Error parsing record:", err.message);
+        console.log("Error parsing record entry:", err.message);
         break;
       }
     }
     
+    console.log("===== PARSING COMPLETE =====");
     console.log("Topics found:", Array.from(topicsMetadata.keys()));
+    for (const [name, metadata] of topicsMetadata.entries()) {
+      console.log(`  ${name}: UUID=${metadata.id?.toString('hex')}, partitions=${metadata.partitions.length}`);
+    }
   } catch (err) {
     console.log("Error reading cluster metadata:", err.message);
   }
@@ -132,68 +133,82 @@ function parseRecordBatch(batchData) {
 
 // Parse an individual record
 function parseRecord(data, startOffset) {
-  let offset = startOffset;
-  
-  // Record format uses varints
-  // length (varint)
-  // attributes (int8)
-  // timestampDelta (varint)
-  // offsetDelta (varint)
-  // keyLength (varint)
-  // key (bytes)
-  // valueLength (varint)
-  // value (bytes)
-  // headers count (varint)
-  
-  const [length, lengthBytes] = readVarint(data, offset);
-  offset += lengthBytes;
-  
-  if (length <= 0 || offset + length > data.length) {
-    return offset;
-  }
-  
-  offset += 1; // attributes
-  
-  const [timestampDelta, tsBytes] = readVarint(data, offset);
-  offset += tsBytes;
-  
-  const [offsetDelta, odBytes] = readVarint(data, offset);
-  offset += odBytes;
-  
-  const [keyLength, klBytes] = readVarint(data, offset);
-  offset += klBytes;
-  
-  if (keyLength > 0) {
-    const key = data.slice(offset, offset + keyLength);
-    offset += keyLength;
+  try {
+    let offset = startOffset;
     
-    // Try to parse key to understand record type
-    // Key often contains frame version and type info
-    if (keyLength >= 3) {
-      const frameVersion = key.readUInt8(0);
-      const recordType = key.readUInt8(1);
-      console.log(`    Record type: ${recordType} (frame v${frameVersion})`);
+    // Record format uses varints
+    // length (varint)
+    // attributes (int8)
+    // timestampDelta (varint)
+    // offsetDelta (varint)
+    // keyLength (varint)
+    // key (bytes)
+    // valueLength (varint)
+    // value (bytes)
+    // headers count (varint)
+    
+    const [length, lengthBytes] = readVarint(data, offset);
+    offset += lengthBytes;
+    
+    if (length <= 0 || startOffset + length + lengthBytes > data.length) {
+      return startOffset + lengthBytes + Math.max(0, length);
+    }
+    
+    const recordEnd = startOffset + length + lengthBytes;
+    
+    offset += 1; // attributes
+    
+    const [timestampDelta, tsBytes] = readVarint(data, offset);
+    offset += tsBytes;
+    
+    const [offsetDelta, odBytes] = readVarint(data, offset);
+    offset += odBytes;
+    
+    const [keyLength, klBytes] = readVarint(data, offset);
+    offset += klBytes;
+    
+    let key = null;
+    let recordType = null;
+    
+    if (keyLength > 0 && offset + keyLength <= recordEnd) {
+      key = data.slice(offset, offset + keyLength);
+      offset += keyLength;
+      
+      // Try to parse key to understand record type
+      // Key contains frame version and type info
+      if (keyLength >= 2) {
+        const frameVersion = key.readUInt8(0);
+        recordType = key.readUInt8(1);
+      }
+    } else {
+      // Skip past key if present
+      if (keyLength > 0) {
+        offset += keyLength;
+      }
+    }
+    
+    const [valueLength, vlBytes] = readVarint(data, offset);
+    offset += vlBytes;
+    
+    if (valueLength > 0 && offset + valueLength <= recordEnd) {
+      const value = data.slice(offset, offset + valueLength);
       
       // Record type 2 = TopicRecord
       // Record type 3 = PartitionRecord
-      if (recordType === 2 || recordType === 3) {
-        const [valueLength, vlBytes] = readVarint(data, offset);
-        offset += vlBytes;
-        
-        if (valueLength > 0 && offset + valueLength <= data.length) {
-          const value = data.slice(offset, offset + valueLength);
-          
-          if (recordType === 2) {
-            parseTopicRecord(value);
-          } else if (recordType === 3) {
-            parsePartitionRecord(key, value);
-          }
-        }
+      if (recordType === 2) {
+        console.log(`    Processing TopicRecord (type ${recordType})`);
+        parseTopicRecord(value);
+      } else if (recordType === 3) {
+        console.log(`    Processing PartitionRecord (type ${recordType})`);
+        parsePartitionRecord(key, value);
       }
     }
+    
+    return recordEnd;
+  } catch (err) {
+    console.log(`    Error in parseRecord: ${err.message}`);
+    return startOffset + 1; // Skip one byte and continue
   }
-  
-  return startOffset + length + lengthBytes;
 }
 
 // Read a varint from buffer
@@ -221,36 +236,46 @@ function readVarint(buffer, offset) {
 // Parse a TopicRecord
 function parseTopicRecord(value) {
   try {
-    // TopicRecord format (frame version + fields)
-    let offset = 1; // Skip frame version
+    if (value.length < 2) return;
     
-    // Read topic name (compact string)
+    // TopicRecord format (frame version + fields)
+    const frameVersion = value.readUInt8(0);
+    let offset = 1;
+    
+    // Read topic name (string with varint length in metadata records)
     const [nameLength, nlBytes] = readVarint(value, offset);
     offset += nlBytes;
     
-    if (nameLength > 0 && offset + nameLength <= value.length) {
-      const topicName = value.toString('utf8', offset, offset + nameLength);
-      offset += nameLength;
-      
-      // Read topic UUID (16 bytes)
-      if (offset + 16 <= value.length) {
-        const topicId = value.slice(offset, offset + 16);
-        
-        console.log(`    Found topic: ${topicName}, UUID: ${topicId.toString('hex')}`);
-        
-        if (!topicsMetadata.has(topicName)) {
-          topicsMetadata.set(topicName, {
-            name: topicName,
-            id: topicId,
-            partitions: []
-          });
-        } else {
-          topicsMetadata.get(topicName).id = topicId;
-        }
-      }
+    if (nameLength <= 0 || offset + nameLength > value.length) {
+      console.log(`    Invalid topic name length: ${nameLength}`);
+      return;
+    }
+    
+    const topicName = value.toString('utf8', offset, offset + nameLength);
+    offset += nameLength;
+    
+    // Read topic UUID (16 bytes) - should be right after topic name
+    if (offset + 16 > value.length) {
+      console.log(`    Not enough bytes for UUID (need 16, have ${value.length - offset})`);
+      return;
+    }
+    
+    const topicId = Buffer.alloc(16);
+    value.copy(topicId, 0, offset, offset + 16);
+    
+    console.log(`    ✓ Found topic: "${topicName}", UUID: ${topicId.toString('hex')}`);
+    
+    if (!topicsMetadata.has(topicName)) {
+      topicsMetadata.set(topicName, {
+        name: topicName,
+        id: topicId,
+        partitions: []
+      });
+    } else {
+      topicsMetadata.get(topicName).id = topicId;
     }
   } catch (err) {
-    console.log("    Error parsing TopicRecord:", err.message);
+    console.log("    Error parsing TopicRecord:", err.message, err.stack);
   }
 }
 
@@ -406,75 +431,115 @@ function buildDescribeTopicPartitionsBody(topicName, topicNameBytes, topicMetada
 // Parse a PartitionRecord
 function parsePartitionRecord(key, value) {
   try {
-    // Key contains partition ID and topic ID
-    // Value contains replica assignments
+    if (!key || key.length < 22) {
+      console.log(`    PartitionRecord key too short: ${key?.length}`);
+      return;
+    }
     
+    // Key contains partition ID and topic ID
     let keyOffset = 2; // Skip frame version and record type
     
     // Read partition ID (int32)
-    if (keyOffset + 4 <= key.length) {
-      const partitionId = key.readInt32BE(keyOffset);
-      keyOffset += 4;
-      
-      // Read topic UUID (16 bytes)
-      if (keyOffset + 16 <= key.length) {
-        const topicIdBytes = key.slice(keyOffset, keyOffset + 16);
-        const topicIdHex = topicIdBytes.toString('hex');
-        
-        // Find topic by UUID
-        let topicName = null;
-        for (const [name, metadata] of topicsMetadata.entries()) {
-          if (metadata.id && metadata.id.toString('hex') === topicIdHex) {
-            topicName = name;
-            break;
-          }
-        }
-        
-        if (topicName) {
-          // Parse value for replica info
-          let valueOffset = 1; // Skip frame version
-          
-          // Read replicas array (compact array)
-          const [replicaCount, rcBytes] = readVarint(value, valueOffset);
-          valueOffset += rcBytes;
-          
-          const replicas = [];
-          for (let i = 0; i < replicaCount && valueOffset < value.length; i++) {
-            const [replica, rBytes] = readVarint(value, valueOffset);
-            valueOffset += rBytes;
-            replicas.push(replica);
-          }
-          
-          // Read ISR array (compact array)
-          const [isrCount, icBytes] = readVarint(value, valueOffset);
-          valueOffset += icBytes;
-          
-          const isr = [];
-          for (let i = 0; i < isrCount && valueOffset < value.length; i++) {
-            const [replica, rBytes] = readVarint(value, valueOffset);
-            valueOffset += rBytes;
-            isr.push(replica);
-          }
-          
-          // Read leader (int32 or varint)
-          const [leader, lBytes] = readVarint(value, valueOffset);
-          valueOffset += lBytes;
-          
-          console.log(`    Partition ${partitionId} for topic ${topicName}: leader=${leader}, replicas=[${replicas}], isr=[${isr}]`);
-          
-          const metadata = topicsMetadata.get(topicName);
-          metadata.partitions.push({
-            partitionId: partitionId,
-            leader: leader,
-            replicas: replicas,
-            isr: isr,
-            leaderEpoch: 0
-          });
-        }
+    const partitionId = key.readInt32BE(keyOffset);
+    keyOffset += 4;
+    
+    // Read topic UUID (16 bytes)
+    const topicIdBytes = Buffer.alloc(16);
+    key.copy(topicIdBytes, 0, keyOffset, keyOffset + 16);
+    const topicIdHex = topicIdBytes.toString('hex');
+    
+    // Find topic by UUID
+    let topicName = null;
+    for (const [name, metadata] of topicsMetadata.entries()) {
+      if (metadata.id && metadata.id.toString('hex') === topicIdHex) {
+        topicName = name;
+        break;
       }
     }
+    
+    if (!topicName) {
+      console.log(`    Partition ${partitionId} for unknown topic UUID: ${topicIdHex}`);
+      return;
+    }
+    
+    // Parse value for replica info
+    if (!value || value.length < 1) {
+      console.log(`    PartitionRecord value too short`);
+      return;
+    }
+    
+    let valueOffset = 1; // Skip frame version
+    
+    // Read replicas array (varint count, then varint values)
+    const [replicaCount, rcBytes] = readVarint(value, valueOffset);
+    valueOffset += rcBytes;
+    
+    const replicas = [];
+    for (let i = 0; i < replicaCount && valueOffset < value.length; i++) {
+      const [replica, rBytes] = readVarint(value, valueOffset);
+      valueOffset += rBytes;
+      replicas.push(replica);
+    }
+    
+    // Read ISR array (varint count, then varint values)
+    const [isrCount, icBytes] = readVarint(value, valueOffset);
+    valueOffset += icBytes;
+    
+    const isr = [];
+    for (let i = 0; i < isrCount && valueOffset < value.length; i++) {
+      const [replica, rBytes] = readVarint(value, valueOffset);
+      valueOffset += rBytes;
+      isr.push(replica);
+    }
+    
+    // There might be more fields, but for now skip to leader
+    // Try to read leader - it might be further in
+    let leader = replicas.length > 0 ? replicas[0] : 1;
+    
+    // Try reading more fields if available
+    if (valueOffset < value.length) {
+      // Skip some fields and try to get leader
+      try {
+        // removingReplicas array
+        const [removingCount, remBytes] = readVarint(value, valueOffset);
+        valueOffset += remBytes;
+        for (let i = 0; i < removingCount && valueOffset < value.length; i++) {
+          const [, skipBytes] = readVarint(value, valueOffset);
+          valueOffset += skipBytes;
+        }
+        
+        // addingReplicas array
+        if (valueOffset < value.length) {
+          const [addingCount, addBytes] = readVarint(value, valueOffset);
+          valueOffset += addBytes;
+          for (let i = 0; i < addingCount && valueOffset < value.length; i++) {
+            const [, skipBytes] = readVarint(value, valueOffset);
+            valueOffset += skipBytes;
+          }
+        }
+        
+        // leader (int32 as varint)
+        if (valueOffset < value.length) {
+          const [leaderVal, lBytes] = readVarint(value, valueOffset);
+          leader = leaderVal;
+        }
+      } catch (e) {
+        // If parsing additional fields fails, stick with first replica as leader
+      }
+    }
+    
+    console.log(`    ✓ Partition ${partitionId} for topic "${topicName}": leader=${leader}, replicas=[${replicas}], isr=[${isr}]`);
+    
+    const metadata = topicsMetadata.get(topicName);
+    metadata.partitions.push({
+      partitionId: partitionId,
+      leader: leader,
+      replicas: replicas,
+      isr: isr,
+      leaderEpoch: 0
+    });
   } catch (err) {
-    console.log("    Error parsing PartitionRecord:", err.message);
+    console.log("    Error parsing PartitionRecord:", err.message, err.stack);
   }
 }
 
