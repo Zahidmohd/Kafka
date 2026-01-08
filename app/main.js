@@ -1313,7 +1313,7 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
       
       // Check if partition exists in topic metadata
       const partitionMetadata = topicMetadata.partitions.find(
-        p => p.partitionIndex === partition.index
+        p => p.partitionId === partition.index
       );
       
       if (!partitionMetadata) {
