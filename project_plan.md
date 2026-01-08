@@ -796,29 +796,230 @@ Future stages will expand this to:
 
 ---
 
+### ✅ Stage 11: Fetch API for Unknown Topic
+
+**Status:** COMPLETED
+
+**What it does:**
+- Parses Fetch v16 request to extract topic_id (UUID)
+- Returns error response for unknown topics
+- Error code 100 (UNKNOWN_TOPIC_ID) at partition level
+
+**Purpose:**
+Handles Fetch requests for topics that don't exist, allowing clients to detect and handle missing topics appropriately.
+
+**Fetch Request v16 Parsing:**
+```javascript
+// Skip standard header fields
+// Skip: max_wait_ms, min_bytes, max_bytes, isolation_level
+// Skip: session_id, session_epoch
+
+// Parse topics array
+const topicsArrayLength = data.readUInt8(offset) - 1;
+for (let i = 0; i < topicsArrayLength; i++) {
+  const topicId = Buffer.alloc(16);
+  data.copy(topicId, 0, offset, offset + 16); // Read UUID
+  requestedTopics.push({ topicId });
+}
+```
+
+**Fetch Response v16 for Unknown Topic:**
+```
+00 00 00 XX  // message_size:      varies
+XX XX XX XX  // correlation_id:    (from request)
+00           // TAG_BUFFER:        empty (header v1)
+00 00 00 00  // throttle_time_ms:  0
+00 00        // error_code:        0 (NO_ERROR at top level)
+00 00 00 00  // session_id:        0
+02           // responses:         2 = 1 topic (COMPACT_ARRAY)
+
+// Topic response:
+XX XX XX XX  // topic_id:          (UUID, 16 bytes)
+XX XX XX XX
+XX XX XX XX
+XX XX XX XX
+02           // partitions:        2 = 1 partition (COMPACT_ARRAY)
+
+// Partition response:
+00 00 00 00  // partition_index:   0
+00 64        // error_code:        100 (UNKNOWN_TOPIC_ID) ✓
+00 00 00 00  // high_watermark:    0 (INT64)
+00 00 00 00
+00 00 00 00  // last_stable_offset: 0 (INT64)
+00 00 00 00
+00 00 00 00  // log_start_offset:  0 (INT64)
+00 00 00 00
+01           // aborted_transactions: empty
+FF FF FF FF  // preferred_read_replica: -1 (no preference)
+00           // records:           null (COMPACT_BYTES)
+00           // TAG_BUFFER:        empty
+00           // TAG_BUFFER (topic): empty
+
+00           // TAG_BUFFER (response): empty
+```
+
+**Fetch Response Fields Explained:**
+
+1. **throttle_time_ms** (INT32): 0 (no throttling)
+
+2. **error_code** (INT16): 0 at top level
+   - Top-level errors apply to the entire request
+   - Per-topic/partition errors are in the responses
+
+3. **session_id** (INT32): 0 (no session)
+
+4. **responses** (COMPACT_ARRAY): Per-topic responses
+   - **topic_id** (UUID): 16-byte topic identifier
+   - **partitions** (COMPACT_ARRAY): Per-partition responses
+     - **partition_index** (INT32): Partition number (0)
+     - **error_code** (INT16): **100 = UNKNOWN_TOPIC_ID**
+     - **high_watermark** (INT64): Highest offset (0 for unknown)
+     - **last_stable_offset** (INT64): Last committed offset (0)
+     - **log_start_offset** (INT64): Earliest offset (0)
+     - **aborted_transactions** (COMPACT_ARRAY): Empty for unknown topic
+     - **preferred_read_replica** (INT32): -1 (no preference)
+     - **records** (COMPACT_BYTES): null/empty for unknown topic
+     - **TAG_BUFFER**: Empty
+
+**Error Code 100 - UNKNOWN_TOPIC_ID:**
+- Indicates the requested topic UUID doesn't exist
+- Client should handle by:
+  - Creating the topic (if allowed)
+  - Retrying with different topic
+  - Reporting error to user
+
+**Key Concepts:**
+- **UUID-based Topic Identification**: Fetch uses UUIDs, not names
+- **Per-Partition Errors**: Errors can be at request, topic, or partition level
+- **Watermarks**: Track message offsets in partitions
+- **Empty Records**: No data returned for unknown topics
+- **INT64 Fields**: Large offsets for high-throughput topics
+
+**Code Highlights:**
+```javascript
+// Parse topic_id (UUID - 16 bytes)
+const topicId = Buffer.alloc(16);
+data.copy(topicId, 0, offset, offset + 16);
+
+// Return error for unknown topic
+responseBody.writeInt16BE(100, offset); // UNKNOWN_TOPIC_ID
+
+// Write INT64 values
+responseBody.writeBigInt64BE(BigInt(0), offset);
+```
+
+---
+
+### ✅ Stage 12: Fetch API for Known Topic (No Messages)
+
+**Status:** COMPLETED
+
+**What it does:**
+- Looks up topics by UUID in cluster metadata
+- Distinguishes between unknown topics and known topics without messages
+- Returns error_code 0 for known topics (even if empty)
+- Returns error_code 100 only for truly unknown topics
+
+**Purpose:**
+Properly handles topics that exist but have no messages yet, allowing consumers to wait for messages without error.
+
+**Topic Lookup by UUID:**
+```javascript
+function findTopicByUUID(topicUUID) {
+  // Check cache first
+  for (const [name, metadata] of topicsMetadata.entries()) {
+    if (metadata && metadata.id && metadata.id.equals(topicUUID)) {
+      return metadata;
+    }
+  }
+  
+  // Search log file for UUID
+  const uuidIndex = logData.indexOf(topicUUID);
+  
+  // Work backwards to find topic name before UUID
+  // Then look up full metadata by name
+  return findTopicInLog(topicName);
+}
+```
+
+**Response Differences:**
+
+**Unknown Topic (error 100):**
+```
+partition_index: 0
+error_code: 100 (UNKNOWN_TOPIC_ID)
+records: null
+```
+
+**Known Topic, No Messages (error 0):**
+```
+partition_index: 0
+error_code: 0 (NO_ERROR) ✓
+high_watermark: 0
+last_stable_offset: 0
+log_start_offset: 0
+records: null (no messages yet)
+```
+
+**Key Difference:**
+- **Unknown topic**: error_code = 100, consumer knows topic doesn't exist
+- **Known topic (empty)**: error_code = 0, consumer knows topic exists but has no messages
+
+**Consumer Behavior:**
+- **Error 100**: Consumer should either create topic or report error
+- **Error 0**: Consumer can wait/poll for messages to arrive
+
+**Implementation:**
+```javascript
+// Look up metadata for each topic by UUID
+const topicsWithMetadata = requestedTopics.map(topic => {
+  const metadata = findTopicByUUID(topic.topicId);
+  const exists = metadata !== null;
+  
+  return {
+    topicId: topic.topicId,
+    metadata: metadata,
+    exists: exists
+  };
+});
+
+// Set appropriate error code
+const errorCode = topic.exists ? 0 : 100;
+responseBody.writeInt16BE(errorCode, offset);
+```
+
+**Key Concepts:**
+- **Topic Existence vs. Message Availability**: Different concepts
+- **UUID Matching**: Topics identified by UUID in Fetch, by name in DescribeTopicPartitions
+- **Empty Records**: Valid state for new/empty topics
+- **Consumer Polling**: Consumers repeatedly fetch from empty topics waiting for messages
+
+---
+
 ## 🔮 Future Stages (To Be Implemented)
 
-### Stage 11: Fetch with Topics and Partitions
-- Parse Fetch request body
-- Return messages from requested topics/partitions
-- Handle offset management
+### Stage 13: Fetch with Actual Messages
+- Read messages from partition log files
+- Return record batches
+- Handle offsets correctly
+- Parse and encode Kafka record format
 
-### Stage 12: Topic Management  
+### Stage 13: Topic Management  
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 13: Produce API
+### Stage 14: Produce API
 - Accept messages from producers
 - Write events to partitions
 - Acknowledge successful writes
 
-### Stage 14: Message Storage
+### Stage 15: Message Storage
 - Persist messages to disk
 - Implement log segments
 - Support for log compaction
 
-### Stage 15: Replication (Advanced)
+### Stage 16: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication
@@ -1087,5 +1288,5 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 10 - Implement Fetch API (Empty Response) Complete
+**Current Stage:** Stage 11 - Fetch API for Unknown Topic Complete
 

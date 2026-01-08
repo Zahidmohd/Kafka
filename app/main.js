@@ -8,6 +8,67 @@ console.log("Logs from your program will appear here!");
 // Store topic metadata in memory (cache)
 const topicsMetadata = new Map();
 
+// Helper: Find topic by UUID
+function findTopicByUUID(topicUUID) {
+  // Check cache first
+  for (const [name, metadata] of topicsMetadata.entries()) {
+    if (metadata && metadata.id && metadata.id.equals(topicUUID)) {
+      return metadata;
+    }
+  }
+  
+  // Not in cache, search the log file
+  const logPath = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log";
+  
+  try {
+    if (!fs.existsSync(logPath)) {
+      return null;
+    }
+    
+    const logData = fs.readFileSync(logPath);
+    
+    // Search for the UUID in the log file
+    const uuidIndex = logData.indexOf(topicUUID);
+    
+    if (uuidIndex === -1) {
+      return null; // UUID not found
+    }
+    
+    // Try to find the topic name before the UUID
+    // The topic name should be right before the UUID (with length prefix)
+    // Work backwards to find the COMPACT_STRING length
+    let nameEndOffset = uuidIndex;
+    
+    // Try different lengths to find valid UTF-8 string
+    for (let nameLen = 1; nameLen <= 50; nameLen++) {
+      try {
+        const nameStartOffset = nameEndOffset - nameLen;
+        if (nameStartOffset < 1) continue;
+        
+        const lengthByte = logData.readUInt8(nameStartOffset - 1);
+        if (lengthByte === nameLen + 1) { // COMPACT_STRING: actual length + 1
+          const topicName = logData.toString('utf8', nameStartOffset, nameEndOffset);
+          
+          // Validate it's a reasonable topic name (alphanumeric, hyphens, underscores)
+          if (/^[a-zA-Z0-9_-]+$/.test(topicName)) {
+            console.log(`✓ Found topic by UUID: "${topicName}"`);
+            
+            // Now find full metadata by name
+            return findTopicInLog(topicName);
+          }
+        }
+      } catch (err) {
+        continue;
+      }
+    }
+    
+    return null;
+  } catch (err) {
+    console.log("Error finding topic by UUID:", err.message);
+    return null;
+  }
+}
+
 // Simple and reliable approach: search for topic name in log file
 function findTopicInLog(topicName) {
   const logPath = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log";
@@ -857,13 +918,26 @@ function handleFetch(connection, requestApiVersion, correlationId, data) {
 
 // Build Fetch response body
 function buildFetchResponseBody(requestedTopics) {
+  // Look up metadata for each topic by UUID
+  const topicsWithMetadata = requestedTopics.map(topic => {
+    const metadata = findTopicByUUID(topic.topicId);
+    const exists = metadata !== null && metadata !== undefined;
+    
+    console.log(`Topic ${topic.topicId.toString('hex').substring(0, 16)}... exists: ${exists}`);
+    
+    return {
+      topicId: topic.topicId,
+      metadata: metadata,
+      exists: exists
+    };
+  });
+  
   // Calculate body size
   let bodySize = 4 + 2 + 4 + 1 + 1; // throttle_time_ms + error_code + session_id + responses_length + TAG_BUFFER
   
-  for (const topic of requestedTopics) {
+  for (const topic of topicsWithMetadata) {
     bodySize += 16; // topic_id (UUID)
     bodySize += 1; // partitions array length
-    // For unknown topic, we return 1 partition with error
     bodySize += 4; // partition_index (INT32)
     bodySize += 2; // error_code (INT16)
     bodySize += 8; // high_watermark (INT64)
@@ -892,11 +966,11 @@ function buildFetchResponseBody(requestedTopics) {
   offset += 4;
   
   // responses (COMPACT_ARRAY): number of topics + 1
-  responseBody.writeUInt8(requestedTopics.length + 1, offset);
+  responseBody.writeUInt8(topicsWithMetadata.length + 1, offset);
   offset += 1;
   
   // Write each topic response
-  for (const topic of requestedTopics) {
+  for (const topic of topicsWithMetadata) {
     // topic_id (UUID - 16 bytes)
     topic.topicId.copy(responseBody, offset);
     offset += 16;
@@ -910,8 +984,9 @@ function buildFetchResponseBody(requestedTopics) {
     responseBody.writeInt32BE(0, offset);
     offset += 4;
     
-    // error_code (INT16): 100 (UNKNOWN_TOPIC_ID)
-    responseBody.writeInt16BE(100, offset);
+    // error_code (INT16): 0 if topic exists, 100 if unknown
+    const errorCode = topic.exists ? 0 : 100;
+    responseBody.writeInt16BE(errorCode, offset);
     offset += 2;
     
     // high_watermark (INT64): 0
