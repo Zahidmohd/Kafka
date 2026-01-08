@@ -1875,7 +1875,250 @@ Consumer Fetches:
 
 ---
 
-## 🔮 Future Stages (To Be Implemented)
+---
+
+## 🌟 Extension Features (Beyond Core Challenge)
+
+### ✅ CreateTopics API (API Key 19)
+
+**Status:** IMPLEMENTED
+
+**What it does:**
+- Allows dynamic creation of topics without restarting the broker
+- Creates partition directories and log files automatically
+- Generates UUIDs for new topics
+- Stores metadata in memory cache
+- Supports multiple partitions per topic
+- Returns success or error for each topic
+
+**Purpose:**
+Enables runtime topic management, making the broker more flexible and production-ready. Clients can create topics on-demand without manual configuration.
+
+**CreateTopics Request Structure:**
+```
+Request Header v2:
+├─ message_size (4)
+├─ request_api_key (2): 19
+├─ request_api_version (2): 0-7
+├─ correlation_id (4)
+├─ client_id (NULLABLE_STRING)
+└─ TAG_BUFFER (1)
+
+Request Body:
+├─ topics (COMPACT_ARRAY)
+│  ├─ name (COMPACT_STRING)
+│  ├─ num_partitions (INT32)
+│  ├─ replication_factor (INT16)
+│  ├─ assignments (COMPACT_ARRAY) - optional
+│  ├─ configs (COMPACT_ARRAY) - optional
+│  └─ TAG_BUFFER
+├─ timeout_ms (INT32)
+└─ TAG_BUFFER
+```
+
+**CreateTopics Response Structure:**
+```
+Response Header v1:
+├─ correlation_id (4)
+└─ TAG_BUFFER (1)
+
+Response Body:
+├─ throttle_time_ms (INT32): 0
+├─ topics (COMPACT_ARRAY)
+│  ├─ name (COMPACT_STRING)
+│  ├─ topic_id (UUID): Generated UUID
+│  ├─ error_code (INT16): 0 for success
+│  ├─ error_message (COMPACT_NULLABLE_STRING)
+│  ├─ num_partitions (INT32)
+│  ├─ replication_factor (INT16)
+│  ├─ configs (COMPACT_ARRAY)
+│  └─ TAG_BUFFER
+└─ TAG_BUFFER
+```
+
+**Implementation:**
+```javascript
+function handleCreateTopics(connection, requestApiVersion, correlationId, data) {
+  // Parse topic names, partition counts, replication factors
+  
+  for (each topic) {
+    // Generate UUID
+    const topicId = generateUUID();
+    
+    // Create partition directories
+    for (p = 0; p < numPartitions; p++) {
+      fs.mkdirSync(`/tmp/kraft-combined-logs/${topicName}-${p}`);
+      fs.writeFileSync(`.../00000000000000000000.log`, Buffer.alloc(0));
+    }
+    
+    // Store in metadata cache
+    topicsMetadata.set(topicName, {
+      name, id: topicId, partitions: [...]
+    });
+  }
+  
+  // Return success response
+}
+```
+
+**Usage Example:**
+```bash
+# Create topic with 3 partitions
+Client → CreateTopics("orders", partitions=3, replication=1)
+Broker → Creates:
+  /tmp/kraft-combined-logs/orders-0/
+  /tmp/kraft-combined-logs/orders-1/
+  /tmp/kraft-combined-logs/orders-2/
+Broker → Response: success, UUID=xxx, partitions=3
+```
+
+**Features:**
+- ✅ Automatic directory creation
+- ✅ Empty log file initialization
+- ✅ UUID generation for topics
+- ✅ Metadata cache updates
+- ✅ Multi-partition support
+- ✅ Error handling
+- ✅ Immediate availability for produce/fetch
+
+---
+
+### ✅ DeleteTopics API (API Key 20)
+
+**Status:** IMPLEMENTED
+
+**What it does:**
+- Removes topics and all their data
+- Deletes partition directories and log files
+- Removes topic from metadata cache
+- Returns success or error for each topic
+- Validates topic existence before deletion
+
+**Purpose:**
+Provides complete topic lifecycle management. Allows cleanup of old/unused topics and their data, freeing up disk space.
+
+**DeleteTopics Request Structure:**
+```
+Request Header v2:
+├─ message_size (4)
+├─ request_api_key (2): 20
+├─ request_api_version (2): 0-6
+├─ correlation_id (4)
+├─ client_id (NULLABLE_STRING)
+└─ TAG_BUFFER (1)
+
+Request Body:
+├─ topics (COMPACT_ARRAY)
+│  ├─ name (COMPACT_STRING)
+│  └─ TAG_BUFFER
+├─ timeout_ms (INT32)
+└─ TAG_BUFFER
+```
+
+**DeleteTopics Response Structure:**
+```
+Response Header v1:
+├─ correlation_id (4)
+└─ TAG_BUFFER (1)
+
+Response Body:
+├─ throttle_time_ms (INT32): 0
+├─ results (COMPACT_ARRAY)
+│  ├─ name (COMPACT_STRING)
+│  ├─ topic_id (UUID): From metadata
+│  ├─ error_code (INT16): 0 for success, 3 if not found
+│  ├─ error_message (COMPACT_NULLABLE_STRING)
+│  └─ TAG_BUFFER
+└─ TAG_BUFFER
+```
+
+**Implementation:**
+```javascript
+function handleDeleteTopics(connection, requestApiVersion, correlationId, data) {
+  // Parse topic names
+  
+  for (each topic) {
+    const metadata = topicsMetadata.get(topicName);
+    
+    if (!metadata) {
+      // Error: topic not found
+      errorCode = 3; // UNKNOWN_TOPIC_OR_PARTITION
+    } else {
+      // Delete partition directories
+      for (partition of metadata.partitions) {
+        fs.unlinkSync(`.../00000000000000000000.log`);
+        fs.rmdirSync(`/tmp/kraft-combined-logs/${topicName}-${p}`);
+      }
+      
+      // Remove from cache
+      topicsMetadata.delete(topicName);
+    }
+  }
+  
+  // Return response
+}
+```
+
+**Usage Example:**
+```bash
+# Delete topic
+Client → DeleteTopics("old-logs")
+Broker → Checks existence ✓
+Broker → Deletes:
+  /tmp/kraft-combined-logs/old-logs-0/ (removed)
+  /tmp/kraft-combined-logs/old-logs-1/ (removed)
+Broker → Removes from cache
+Broker → Response: success, UUID=xxx
+```
+
+**Features:**
+- ✅ Recursive directory deletion
+- ✅ Log file cleanup
+- ✅ Metadata cache cleanup
+- ✅ Existence validation
+- ✅ Error handling
+- ✅ Multi-topic deletion support
+
+---
+
+### 🎯 Topic Management Benefits
+
+**Dynamic Operations:**
+```
+Before: Manual configuration files, broker restart required
+After: Runtime API calls, immediate availability
+```
+
+**Complete Lifecycle:**
+```
+CREATE → USE (Produce/Fetch) → DELETE
+  ↓         ↓                      ↓
+Topic    Data flows             Cleanup
+created  normally               complete
+```
+
+**Production Benefits:**
+- ✅ No downtime for topic changes
+- ✅ Automated topic provisioning
+- ✅ Easy cleanup of test topics
+- ✅ Dynamic scaling
+- ✅ Self-service for developers
+- ✅ Reduced operational overhead
+
+**API Coverage:**
+```
+6 APIs Implemented:
+├─ Produce (0): Write messages
+├─ Fetch (1): Read messages
+├─ ApiVersions (18): Discover APIs
+├─ CreateTopics (19): Create topics ← NEW!
+├─ DeleteTopics (20): Delete topics ← NEW!
+└─ DescribeTopicPartitions (75): Get metadata
+```
+
+---
+
+## 🔮 Future Enhancement Ideas
 
 ### Stage 18: Multiple Record Batches
 
@@ -2177,6 +2420,7 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 18 - Multiple Records in Single Request Complete  
-**Total Lines of Code:** ~1,850 lines
+**Status:** Core Implementation Complete + Topic Management Extensions  
+**Total Lines of Code:** ~2,200 lines  
+**APIs Implemented:** 6 (Produce, Fetch, ApiVersions, CreateTopics, DeleteTopics, DescribeTopicPartitions)
 
