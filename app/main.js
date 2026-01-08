@@ -151,26 +151,55 @@ function findTopicInLog(topicName) {
     
     const logData = fs.readFileSync(logPath);
     console.log(`Searching for topic "${topicName}" in log file (${logData.length} bytes)`);
+    console.log(`First 200 bytes of log:`, logData.slice(0, 200).toString('hex'));
     
     // Convert topic name to buffer for searching
     const topicNameBuffer = Buffer.from(topicName, 'utf-8');
-    const topicNameIndex = logData.indexOf(topicNameBuffer);
+    console.log(`Looking for topic name buffer:`, topicNameBuffer.toString('hex'));
+    
+    // Search for the topic name - it should be preceded by a length byte
+    // In COMPACT_STRING format: length+1, then the string bytes
+    const searchPattern = Buffer.concat([
+      Buffer.from([topicName.length + 1]), // COMPACT_STRING length
+      topicNameBuffer
+    ]);
+    console.log(`Search pattern (length+name):`, searchPattern.toString('hex'));
+    
+    const topicNameIndex = logData.indexOf(searchPattern);
     
     if (topicNameIndex === -1) {
-      console.log(`Topic "${topicName}" not found in log file`);
-      return null;
+      console.log(`Topic "${topicName}" not found with COMPACT_STRING encoding`);
+      // Try without length prefix (fallback to old method)
+      const fallbackIndex = logData.indexOf(topicNameBuffer);
+      if (fallbackIndex === -1) {
+        console.log(`Topic "${topicName}" not found in log file at all`);
+        return null;
+      }
+      console.log(`Found topic name at index ${fallbackIndex} (without length prefix)`);
+      // Adjust index to point to start of name (after length byte)
+      const adjustedIndex = fallbackIndex;
+      
+      // Extract topic UUID (16 bytes immediately after the topic name)
+      const topicUUID = Buffer.alloc(16);
+      logData.copy(topicUUID, 0, adjustedIndex + topicNameBuffer.length, adjustedIndex + topicNameBuffer.length + 16);
+      
+      console.log('✓ Topic UUID:', topicUUID.toString('hex'));
+      
+      return findPartitionsForTopic(topicName, topicUUID, logData, adjustedIndex + topicNameBuffer.length + 16);
     }
     
     console.log(`✓ Found topic "${topicName}" at index:`, topicNameIndex);
     
-    // Extract topic UUID (16 bytes immediately after the topic name)
+    // Extract topic UUID (16 bytes immediately after the search pattern)
+    // searchPattern is: length byte + topic name, so UUID is after both
     const topicUUID = Buffer.alloc(16);
-    logData.copy(topicUUID, 0, topicNameIndex + topicNameBuffer.length, topicNameIndex + topicNameBuffer.length + 16);
+    const uuidStart = topicNameIndex + searchPattern.length;
+    logData.copy(topicUUID, 0, uuidStart, uuidStart + 16);
     
     console.log('✓ Topic UUID:', topicUUID.toString('hex'));
     
     // Search for ALL partition data by finding ALL occurrences of the UUID in the log
-    const searchStart = topicNameIndex + topicNameBuffer.length + 16;
+    const searchStart = topicNameIndex + searchPattern.length + 16;
     const remainingLogFile = logData.subarray(searchStart);
     
     // Helper: read compact array (length + 1 encoding)
