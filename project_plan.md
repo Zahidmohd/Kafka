@@ -203,33 +203,104 @@ response.writeInt32BE(messageSize, 0);
 
 ---
 
+### ✅ Stage 5: Advertise DescribeTopicPartitions API
+
+**Status:** COMPLETED
+
+**What it does:**
+- Adds a second API entry to the ApiVersions response
+- Advertises support for the DescribeTopicPartitions API (API key 75)
+- Updates the COMPACT_ARRAY to include 2 elements instead of 1
+
+**Purpose:**
+This stage prepares the broker to handle topic metadata requests by advertising the DescribeTopicPartitions API capability.
+
+**Supported APIs (Now Advertised):**
+1. **API 18 (ApiVersions)**: versions 0-4
+2. **API 75 (DescribeTopicPartitions)**: version 0
+
+**Updated Response Structure:**
+```
+00 00 00 1a  // message_size:      26 bytes (header 4 + body 22)
+XX XX XX XX  // correlation_id:    (echoed from request)
+00 00        // error_code:        0 (no error)
+03           // api_keys length:   3 = 2 elements (COMPACT_ARRAY encoding)
+
+// First API entry
+00 12        // api_key:           18 (ApiVersions)
+00 00        // min_version:       0
+00 04        // max_version:       4
+00           // TAG_BUFFER:        empty
+
+// Second API entry
+00 4b        // api_key:           75 (DescribeTopicPartitions)
+00 00        // min_version:       0
+00 00        // max_version:       0
+00           // TAG_BUFFER:        empty
+
+00 00 00 00  // throttle_time_ms:  0
+00           // TAG_BUFFER:        empty
+```
+
+**Key Concepts:**
+- **API Discovery**: Clients use ApiVersions to discover what the broker supports
+- **Multiple API Support**: Broker can advertise support for multiple APIs
+- **COMPACT_ARRAY Growth**: Length prefix changes from 2 (1 element) to 3 (2 elements)
+- **Version Ranges**: Different APIs can have different supported version ranges
+
+**Code Highlights:**
+```javascript
+// COMPACT_ARRAY: 2 elements encoded as 3
+responseBody.writeUInt8(3, offset);
+
+// First API: ApiVersions (18)
+responseBody.writeInt16BE(18, offset);  // api_key
+responseBody.writeInt16BE(0, offset);   // min_version: 0
+responseBody.writeInt16BE(4, offset);   // max_version: 4
+
+// Second API: DescribeTopicPartitions (75)
+responseBody.writeInt16BE(75, offset);  // api_key
+responseBody.writeInt16BE(0, offset);   // min_version: 0
+responseBody.writeInt16BE(0, offset);   // max_version: 0
+```
+
+**What's DescribeTopicPartitions?**
+The DescribeTopicPartitions API is used to query metadata about topics and their partitions:
+- Topic names and IDs
+- Number of partitions per topic
+- Partition leaders and replicas
+- Topic configuration
+- Partition states
+
+---
+
 ## 🔮 Future Stages (To Be Implemented)
 
-### Stage 5: DescribeTopicPartitions API
-- Implement support for querying topic metadata
-- Return information about topics and their partitions
+### Stage 6: Implement DescribeTopicPartitions Request Handling
+- Actually handle DescribeTopicPartitions requests
+- Return metadata about topics and partitions
 
-### Stage 6: Topic Management
+### Stage 7: Topic Management
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 7: Produce API
+### Stage 8: Produce API
 - Accept messages from producers
 - Write events to partitions
 - Acknowledge successful writes
 
-### Stage 8: Fetch API
+### Stage 9: Fetch API
 - Allow consumers to read messages
 - Support offset-based reading
 - Implement batching
 
-### Stage 9: Message Storage
+### Stage 10: Message Storage
 - Persist messages to disk
 - Implement log segments
 - Support for log compaction
 
-### Stage 10: Replication (Advanced)
+### Stage 11: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication
@@ -445,5 +516,5 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 4 - ApiVersions API Complete
+**Current Stage:** Stage 5 - DescribeTopicPartitions API Advertised
 
