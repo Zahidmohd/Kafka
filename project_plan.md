@@ -717,28 +717,108 @@ responseBody.writeInt16BE(16, offset);  // max_version
 
 ---
 
+### ✅ Stage 10: Implement Fetch API (Empty Response)
+
+**Status:** COMPLETED
+
+**What it does:**
+- Handles Fetch requests (API key 1)
+- Returns a valid Fetch v16 response for empty topic array
+- Uses Response Header v1 (with TAG_BUFFER)
+
+**Purpose:**
+First step in implementing the Fetch API. Handles the basic response structure before adding actual message fetching logic.
+
+**Fetch Response v16 Structure:**
+```
+00 00 00 11  // message_size:      17 bytes (header 5 + body 12)
+XX XX XX XX  // correlation_id:    (echoed from request)
+00           // TAG_BUFFER:        empty (response header v1)
+00 00 00 00  // throttle_time_ms:  0
+00 00        // error_code:        0 (NO_ERROR)
+00 00 00 00  // session_id:        0
+01           // responses:         1 = 0 elements (COMPACT_ARRAY, empty)
+00           // TAG_BUFFER:        empty
+```
+
+**Fetch Response Fields Explained:**
+
+1. **throttle_time_ms** (INT32): How long client should wait before next request
+   - Set to 0 (no throttling)
+
+2. **error_code** (INT16): Top-level error code
+   - 0 = NO_ERROR
+   - Other codes: OFFSET_OUT_OF_RANGE, UNKNOWN_TOPIC_OR_PARTITION, etc.
+
+3. **session_id** (INT32): Fetch session ID for incremental fetching
+   - Used in KIP-227 for efficient fetching
+   - 0 means no session
+
+4. **responses** (COMPACT_ARRAY): Array of per-topic responses
+   - Empty for this stage (no topics requested)
+   - Will contain topic data in future stages
+
+**Key Concepts:**
+- **Fetch API**: Primary API for consuming messages from Kafka
+- **Response Header v1**: Same as DescribeTopicPartitions (includes TAG_BUFFER)
+- **Empty Response**: Valid response when no topics are requested
+- **Session-based Fetching**: Allows stateful fetching for efficiency
+
+**Code Highlights:**
+```javascript
+function handleFetch(connection, requestApiVersion, correlationId, data) {
+  // Build minimal Fetch v16 response
+  const responseBody = Buffer.alloc(12);
+  
+  // throttle_time_ms: 0
+  responseBody.writeInt32BE(0, offset);
+  
+  // error_code: 0  
+  responseBody.writeInt16BE(0, offset);
+  
+  // session_id: 0
+  responseBody.writeInt32BE(0, offset);
+  
+  // responses: empty array
+  responseBody.writeUInt8(1, offset); // 0 elements + 1
+  
+  // TAG_BUFFER: empty
+  responseBody.writeUInt8(0, offset);
+}
+```
+
+**What's Next:**
+Future stages will expand this to:
+- Parse topic and partition requests
+- Read actual messages from log files
+- Return batches of records
+- Handle offsets and max bytes limits
+
+---
+
 ## 🔮 Future Stages (To Be Implemented)
 
-### Stage 10: Implement Fetch API Request Handling
-- Actually handle Fetch requests
-- Return messages from topics/partitions
+### Stage 11: Fetch with Topics and Partitions
+- Parse Fetch request body
+- Return messages from requested topics/partitions
+- Handle offset management
 
-### Stage 11: Topic Management  
+### Stage 12: Topic Management  
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 12: Produce API
+### Stage 13: Produce API
 - Accept messages from producers
 - Write events to partitions
 - Acknowledge successful writes
 
-### Stage 13: Message Storage
+### Stage 14: Message Storage
 - Persist messages to disk
 - Implement log segments
 - Support for log compaction
 
-### Stage 14: Replication (Advanced)
+### Stage 15: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication
@@ -1007,5 +1087,5 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 9 - Advertise Fetch API Complete
+**Current Stage:** Stage 10 - Implement Fetch API (Empty Response) Complete
 

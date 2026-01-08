@@ -780,41 +780,65 @@ function parsePartitionRecord(key, value) {
 
 // Handler for Fetch API (API key 1)
 function handleFetch(connection, requestApiVersion, correlationId, data) {
-  console.log("Handling Fetch request");
-  console.log("Request API Version:", requestApiVersion);
+  console.log("Handling Fetch request v" + requestApiVersion);
   
-  // For this stage, we just return an empty response
-  // Fetch Response v16 structure:
-  // - Header v1: correlation_id + TAG_BUFFER
-  // - Body:
-  //   - throttle_time_ms (INT32): 0
-  //   - error_code (INT16): 0
-  //   - session_id (INT32): 0
-  //   - responses (COMPACT_ARRAY): empty array (1 in compact encoding = 0 elements)
-  //   - TAG_BUFFER: 0
+  // Parse Fetch v16 request
+  // After the standard header (message_size, api_key, api_version, correlation_id, client_id, TAG_BUFFER)
+  // we need to parse the Fetch request body
   
-  const responseBody = Buffer.alloc(12);
-  let offset = 0;
+  let offset = 12; // Start after message_size, api_key, api_version, correlation_id
   
-  // throttle_time_ms (INT32): 0
-  responseBody.writeInt32BE(0, offset);
-  offset += 4;
-  
-  // error_code (INT16): 0
-  responseBody.writeInt16BE(0, offset);
+  // Skip client_id (NULLABLE_STRING - INT16 length + bytes)
+  const clientIdLength = data.readInt16BE(offset);
   offset += 2;
+  if (clientIdLength >= 0) {
+    offset += clientIdLength;
+  }
   
-  // session_id (INT32): 0
-  responseBody.writeInt32BE(0, offset);
-  offset += 4;
-  
-  // responses (COMPACT_ARRAY): empty (0 elements = 1 in compact encoding)
-  responseBody.writeUInt8(1, offset);
+  // Skip TAG_BUFFER from header (1 byte)
   offset += 1;
   
-  // TAG_BUFFER (empty)
-  responseBody.writeUInt8(0, offset);
+  // Now we're at the Fetch request body
+  // Parse enough to get the topic_id
+  // Fetch Request v16 body has many fields, but we need to skip to topics array
+  
+  // Skip: max_wait_ms (INT32), min_bytes (INT32), max_bytes (INT32), isolation_level (INT8)
+  offset += 4 + 4 + 4 + 1;
+  
+  // Skip: session_id (INT32), session_epoch (INT32)
+  offset += 4 + 4;
+  
+  // topics (COMPACT_ARRAY)
+  const topicsArrayLength = data.readUInt8(offset) - 1;
   offset += 1;
+  
+  console.log("Number of topics in Fetch request:", topicsArrayLength);
+  
+  // Parse topics
+  const requestedTopics = [];
+  for (let i = 0; i < topicsArrayLength; i++) {
+    // topic_id (UUID - 16 bytes)
+    const topicId = Buffer.alloc(16);
+    data.copy(topicId, 0, offset, offset + 16);
+    offset += 16;
+    
+    console.log(`Topic ${i + 1} ID:`, topicId.toString('hex'));
+    
+    // We don't need to parse partitions for this stage, just skip them
+    // partitions (COMPACT_ARRAY)
+    const partitionsArrayLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    
+    // Skip partition details (we'll add this in future stages)
+    // For now, just record the topic_id
+    requestedTopics.push({
+      topicId: topicId,
+      partitionCount: partitionsArrayLength
+    });
+  }
+  
+  // Build Fetch v16 response
+  const responseBody = buildFetchResponseBody(requestedTopics);
   
   // Build response with header v1
   const headerSize = 4 + 1; // correlation_id (4) + TAG_BUFFER (1)
@@ -829,6 +853,105 @@ function handleFetch(connection, requestApiVersion, correlationId, data) {
   
   console.log("Sending Fetch response:", response.toString('hex'));
   connection.write(response);
+}
+
+// Build Fetch response body
+function buildFetchResponseBody(requestedTopics) {
+  // Calculate body size
+  let bodySize = 4 + 2 + 4 + 1 + 1; // throttle_time_ms + error_code + session_id + responses_length + TAG_BUFFER
+  
+  for (const topic of requestedTopics) {
+    bodySize += 16; // topic_id (UUID)
+    bodySize += 1; // partitions array length
+    // For unknown topic, we return 1 partition with error
+    bodySize += 4; // partition_index (INT32)
+    bodySize += 2; // error_code (INT16)
+    bodySize += 8; // high_watermark (INT64)
+    bodySize += 8; // last_stable_offset (INT64)
+    bodySize += 8; // log_start_offset (INT64)
+    bodySize += 1; // aborted_transactions (COMPACT_ARRAY - empty)
+    bodySize += 4; // preferred_read_replica (INT32)
+    bodySize += 1; // records (COMPACT_BYTES - empty/null)
+    bodySize += 1; // TAG_BUFFER
+    bodySize += 1; // TAG_BUFFER (for topic)
+  }
+  
+  const responseBody = Buffer.alloc(bodySize);
+  let offset = 0;
+  
+  // throttle_time_ms (INT32): 0
+  responseBody.writeInt32BE(0, offset);
+  offset += 4;
+  
+  // error_code (INT16): 0 (top-level, no error)
+  responseBody.writeInt16BE(0, offset);
+  offset += 2;
+  
+  // session_id (INT32): 0
+  responseBody.writeInt32BE(0, offset);
+  offset += 4;
+  
+  // responses (COMPACT_ARRAY): number of topics + 1
+  responseBody.writeUInt8(requestedTopics.length + 1, offset);
+  offset += 1;
+  
+  // Write each topic response
+  for (const topic of requestedTopics) {
+    // topic_id (UUID - 16 bytes)
+    topic.topicId.copy(responseBody, offset);
+    offset += 16;
+    
+    // partitions (COMPACT_ARRAY): 1 partition + 1 = 2
+    responseBody.writeUInt8(2, offset);
+    offset += 1;
+    
+    // Partition response
+    // partition_index (INT32): 0
+    responseBody.writeInt32BE(0, offset);
+    offset += 4;
+    
+    // error_code (INT16): 100 (UNKNOWN_TOPIC_ID)
+    responseBody.writeInt16BE(100, offset);
+    offset += 2;
+    
+    // high_watermark (INT64): 0
+    responseBody.writeBigInt64BE(BigInt(0), offset);
+    offset += 8;
+    
+    // last_stable_offset (INT64): 0
+    responseBody.writeBigInt64BE(BigInt(0), offset);
+    offset += 8;
+    
+    // log_start_offset (INT64): 0
+    responseBody.writeBigInt64BE(BigInt(0), offset);
+    offset += 8;
+    
+    // aborted_transactions (COMPACT_ARRAY): empty (0 elements = 1)
+    responseBody.writeUInt8(1, offset);
+    offset += 1;
+    
+    // preferred_read_replica (INT32): -1 (no preference)
+    responseBody.writeInt32BE(-1, offset);
+    offset += 4;
+    
+    // records (COMPACT_BYTES): null (-1 in compact encoding = 0)
+    responseBody.writeUInt8(0, offset);
+    offset += 1;
+    
+    // TAG_BUFFER (empty)
+    responseBody.writeUInt8(0, offset);
+    offset += 1;
+    
+    // TAG_BUFFER for topic (empty)
+    responseBody.writeUInt8(0, offset);
+    offset += 1;
+  }
+  
+  // TAG_BUFFER (empty)
+  responseBody.writeUInt8(0, offset);
+  offset += 1;
+  
+  return responseBody;
 }
 
 // Handler for ApiVersions API (API key 18)
