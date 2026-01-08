@@ -8,6 +8,9 @@ console.log("Logs from your program will appear here!");
 // Store topic metadata in memory (cache)
 const topicsMetadata = new Map();
 
+// Store transaction state in memory
+const transactions = new Map(); // transactionalId -> { producerId, producerEpoch, state, partitions }
+
 // Helper: Read messages from partition log file
 function readPartitionLog(topicName, partitionId) {
   const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partitionId}`;
@@ -1263,8 +1266,11 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
   // transactional_id (COMPACT_NULLABLE_STRING)
   const transactionalIdLength = data.readUInt8(offset) - 1;
   offset += 1;
+  let transactionalId = null;
   if (transactionalIdLength >= 0) {
+    transactionalId = data.toString('utf8', offset, offset + transactionalIdLength);
     offset += transactionalIdLength;
+    console.log(`Transactional Produce: txnId="${transactionalId}"`);
   }
   
   // acks (INT16)
@@ -1403,6 +1409,22 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
             partition.baseOffset = 0n; // First record in partition
             partition.logAppendTimeMs = -1n; // Latest timestamp
             partition.logStartOffset = 0n; // Start of log
+            
+            // Track partition for transaction if transactional produce
+            if (transactionalId) {
+              const txnState = transactions.get(transactionalId);
+              if (txnState) {
+                // Add partition to transaction if not already tracked
+                const partitionKey = `${topic.name}-${partition.index}`;
+                if (!txnState.partitions.some(p => `${p.topic}-${p.partition}` === partitionKey)) {
+                  txnState.partitions.push({
+                    topic: topic.name,
+                    partition: partition.index
+                  });
+                  console.log(`      Tracked partition ${partitionKey} for transaction "${transactionalId}"`);
+                }
+              }
+            }
           } else {
             // Write failed
             partition.errorCode = 3; // Return error if write fails
@@ -1559,16 +1581,16 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   }
   
   // Build ApiVersions v4 response body
-  // Body size: error_code(2) + array_length(1) + 7*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 57 bytes
-  const responseBody = Buffer.alloc(57);
+  // Body size: error_code(2) + array_length(1) + 8*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 64 bytes
+  const responseBody = Buffer.alloc(64);
   let offset = 0;
   
   // error_code (INT16): 0
   responseBody.writeInt16BE(0, offset);
   offset += 2;
   
-  // api_keys (COMPACT_ARRAY): 7 entries = 8 in compact encoding
-  responseBody.writeUInt8(8, offset);
+  // api_keys (COMPACT_ARRAY): 8 entries = 9 in compact encoding
+  responseBody.writeUInt8(9, offset);
   offset += 1;
   
   // API key entry 1: Produce (0)
@@ -1621,7 +1643,17 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 6: CreatePartitions (37)
+  // API key entry 6: EndTxn (26)
+  responseBody.writeInt16BE(26, offset); // api_key
+  offset += 2;
+  responseBody.writeInt16BE(0, offset);  // min_version
+  offset += 2;
+  responseBody.writeInt16BE(4, offset);  // max_version
+  offset += 2;
+  responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+  offset += 1;
+  
+  // API key entry 7: CreatePartitions (37)
   responseBody.writeInt16BE(37, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -1631,7 +1663,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 7: DescribeTopicPartitions (75)
+  // API key entry 8: DescribeTopicPartitions (75)
   responseBody.writeInt16BE(75, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -1777,6 +1809,225 @@ function handleDescribeTopicPartitions(connection, data, correlationId) {
   
   console.log("Sending DescribeTopicPartitions response:", response.toString('hex'));
   connection.write(response);
+}
+
+// Handler for EndTxn API (API key 26)
+function handleEndTxn(connection, requestApiVersion, correlationId, data) {
+  console.log("Handling EndTxn request");
+  
+  // Parse EndTxn request
+  let offset = 12; // Skip message_size, api_key, api_version, correlation_id
+  
+  // Parse client_id (NULLABLE_STRING)
+  const clientIdLength = data.readInt16BE(offset);
+  offset += 2;
+  if (clientIdLength > 0) {
+    offset += clientIdLength;
+  }
+  
+  // TAG_BUFFER (header)
+  offset += 1;
+  
+  // Parse request body
+  // transactional_id (COMPACT_STRING)
+  const transactionalIdLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  const transactionalId = data.toString('utf8', offset, offset + transactionalIdLength);
+  offset += transactionalIdLength;
+  
+  // producer_id (INT64)
+  const producerId = data.readBigInt64BE(offset);
+  offset += 8;
+  
+  // producer_epoch (INT16)
+  const producerEpoch = data.readInt16BE(offset);
+  offset += 2;
+  
+  // committed (BOOLEAN) - true to commit, false to abort
+  const committed = data.readUInt8(offset) === 1;
+  offset += 1;
+  
+  // TAG_BUFFER
+  offset += 1;
+  
+  console.log(`Transaction: ${transactionalId}, Producer: ${producerId}, Epoch: ${producerEpoch}, Action: ${committed ? 'COMMIT' : 'ABORT'}`);
+  
+  // Get or create transaction state
+  let txnState = transactions.get(transactionalId);
+  
+  if (!txnState) {
+    // Initialize new transaction
+    txnState = {
+      producerId: producerId,
+      producerEpoch: producerEpoch,
+      state: 'EMPTY',
+      partitions: []
+    };
+    transactions.set(transactionalId, txnState);
+    console.log(`  Created new transaction state for "${transactionalId}"`);
+  }
+  
+  // Validate producer
+  let errorCode = 0;
+  
+  if (txnState.producerId !== producerId) {
+    errorCode = 49; // INVALID_PRODUCER_ID_MAPPING
+    console.log(`  ✗ Invalid producer ID: expected ${txnState.producerId}, got ${producerId}`);
+  } else if (txnState.producerEpoch !== producerEpoch) {
+    errorCode = 51; // INVALID_PRODUCER_EPOCH
+    console.log(`  ✗ Invalid producer epoch: expected ${txnState.producerEpoch}, got ${producerEpoch}`);
+  } else {
+    // Valid transaction - process commit or abort
+    if (committed) {
+      console.log(`  ✓ Committing transaction "${transactionalId}"`);
+      txnState.state = 'COMMITTED';
+      
+      // Write commit markers to all partitions involved in the transaction
+      for (const partition of txnState.partitions) {
+        writeTransactionMarker(partition.topic, partition.partition, producerId, producerEpoch, true);
+      }
+    } else {
+      console.log(`  ✓ Aborting transaction "${transactionalId}"`);
+      txnState.state = 'ABORTED';
+      
+      // Write abort markers to all partitions involved in the transaction
+      for (const partition of txnState.partitions) {
+        writeTransactionMarker(partition.topic, partition.partition, producerId, producerEpoch, false);
+      }
+    }
+    
+    // Clear partition list for next transaction
+    txnState.partitions = [];
+  }
+  
+  // Build response
+  const bodySize = 4 + 2 + 1; // throttle_time_ms + error_code + TAG_BUFFER
+  const headerSize = 4 + 1; // correlation_id + TAG_BUFFER
+  const response = Buffer.alloc(4 + headerSize + bodySize);
+  let responseOffset = 0;
+  
+  // message_size
+  response.writeInt32BE(headerSize + bodySize, responseOffset);
+  responseOffset += 4;
+  
+  // Response Header v1
+  response.writeInt32BE(correlationId, responseOffset);
+  responseOffset += 4;
+  response.writeUInt8(0, responseOffset); // TAG_BUFFER
+  responseOffset += 1;
+  
+  // Response Body
+  // throttle_time_ms
+  response.writeInt32BE(0, responseOffset);
+  responseOffset += 4;
+  
+  // error_code
+  response.writeInt16BE(errorCode, responseOffset);
+  responseOffset += 2;
+  
+  // TAG_BUFFER (final)
+  response.writeUInt8(0, responseOffset);
+  responseOffset += 1;
+  
+  console.log("Sending EndTxn response:", response.toString('hex'));
+  connection.write(response);
+}
+
+// Helper: Write transaction marker to partition log
+function writeTransactionMarker(topicName, partitionIndex, producerId, producerEpoch, commit) {
+  const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partitionIndex}`;
+  const logFile = `${partitionDir}/00000000000000000000.log`;
+  
+  console.log(`  Writing ${commit ? 'COMMIT' : 'ABORT'} marker to ${topicName}-${partitionIndex}`);
+  
+  try {
+    if (!fs.existsSync(partitionDir)) {
+      console.log(`    Partition directory doesn't exist, skipping marker`);
+      return false;
+    }
+    
+    // Create transaction marker (control batch)
+    // This is a simplified version - real Kafka markers are more complex
+    const markerBatch = Buffer.alloc(61);
+    let offset = 0;
+    
+    // partitionLeaderEpoch (4 bytes)
+    markerBatch.writeInt32BE(0, offset);
+    offset += 4;
+    
+    // magic (1 byte) - version 2
+    markerBatch.writeUInt8(2, offset);
+    offset += 1;
+    
+    // crc (4 bytes) - simplified, should be calculated
+    markerBatch.writeInt32BE(0, offset);
+    offset += 4;
+    
+    // attributes (2 bytes) - bit 5 set for control batch
+    markerBatch.writeInt16BE(0x0020, offset);
+    offset += 2;
+    
+    // lastOffsetDelta (4 bytes)
+    markerBatch.writeInt32BE(0, offset);
+    offset += 4;
+    
+    // baseTimestamp (8 bytes)
+    markerBatch.writeBigInt64BE(BigInt(Date.now()), offset);
+    offset += 8;
+    
+    // maxTimestamp (8 bytes)
+    markerBatch.writeBigInt64BE(BigInt(Date.now()), offset);
+    offset += 8;
+    
+    // producerId (8 bytes)
+    markerBatch.writeBigInt64BE(producerId, offset);
+    offset += 8;
+    
+    // producerEpoch (2 bytes)
+    markerBatch.writeInt16BE(producerEpoch, offset);
+    offset += 2;
+    
+    // baseSequence (4 bytes)
+    markerBatch.writeInt32BE(0, offset);
+    offset += 4;
+    
+    // recordsCount (4 bytes) - 1 control record
+    markerBatch.writeInt32BE(1, offset);
+    offset += 4;
+    
+    // Control record data (simplified)
+    // version (2 bytes) - 0 for ABORT, 1 for COMMIT
+    markerBatch.writeInt16BE(commit ? 1 : 0, offset);
+    offset += 2;
+    
+    // coordinatorEpoch (4 bytes)
+    markerBatch.writeInt32BE(0, offset);
+    offset += 4;
+    
+    // Prepare log entry with baseOffset and batchLength
+    const logEntry = Buffer.alloc(8 + 4 + markerBatch.length);
+    let logOffset = 0;
+    
+    // baseOffset (8 bytes) - use current log size / approximate
+    logEntry.writeBigInt64BE(0n, logOffset);
+    logOffset += 8;
+    
+    // batchLength (4 bytes)
+    logEntry.writeInt32BE(markerBatch.length, logOffset);
+    logOffset += 4;
+    
+    // marker batch
+    markerBatch.copy(logEntry, logOffset);
+    
+    // Append to log file
+    fs.appendFileSync(logFile, logEntry);
+    
+    console.log(`    ✓ Transaction marker written successfully`);
+    return true;
+  } catch (err) {
+    console.error(`    ✗ Error writing transaction marker:`, err.message);
+    return false;
+  }
 }
 
 // Handler for CreateTopics API (API key 19)
@@ -2361,6 +2612,9 @@ const server = net.createServer((connection) => {
     } else if (requestApiKey === 20) {
       // DeleteTopics API
       handleDeleteTopics(connection, requestApiVersion, correlationId, data);
+    } else if (requestApiKey === 26) {
+      // EndTxn API
+      handleEndTxn(connection, requestApiVersion, correlationId, data);
     } else if (requestApiKey === 37) {
       // CreatePartitions API
       handleCreatePartitions(connection, requestApiVersion, correlationId, data);
