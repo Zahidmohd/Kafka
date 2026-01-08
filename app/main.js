@@ -778,6 +778,59 @@ function parsePartitionRecord(key, value) {
   }
 }
 
+// Handler for Fetch API (API key 1)
+function handleFetch(connection, requestApiVersion, correlationId, data) {
+  console.log("Handling Fetch request");
+  console.log("Request API Version:", requestApiVersion);
+  
+  // For this stage, we just return an empty response
+  // Fetch Response v16 structure:
+  // - Header v1: correlation_id + TAG_BUFFER
+  // - Body:
+  //   - throttle_time_ms (INT32): 0
+  //   - error_code (INT16): 0
+  //   - session_id (INT32): 0
+  //   - responses (COMPACT_ARRAY): empty array (1 in compact encoding = 0 elements)
+  //   - TAG_BUFFER: 0
+  
+  const responseBody = Buffer.alloc(12);
+  let offset = 0;
+  
+  // throttle_time_ms (INT32): 0
+  responseBody.writeInt32BE(0, offset);
+  offset += 4;
+  
+  // error_code (INT16): 0
+  responseBody.writeInt16BE(0, offset);
+  offset += 2;
+  
+  // session_id (INT32): 0
+  responseBody.writeInt32BE(0, offset);
+  offset += 4;
+  
+  // responses (COMPACT_ARRAY): empty (0 elements = 1 in compact encoding)
+  responseBody.writeUInt8(1, offset);
+  offset += 1;
+  
+  // TAG_BUFFER (empty)
+  responseBody.writeUInt8(0, offset);
+  offset += 1;
+  
+  // Build response with header v1
+  const headerSize = 4 + 1; // correlation_id (4) + TAG_BUFFER (1)
+  const messageSize = headerSize + responseBody.length;
+  
+  // Create full response
+  const response = Buffer.alloc(4 + messageSize);
+  response.writeInt32BE(messageSize, 0);
+  response.writeInt32BE(correlationId, 4);
+  response.writeUInt8(0, 8); // TAG_BUFFER (empty) for header v1
+  responseBody.copy(response, 9);
+  
+  console.log("Sending Fetch response:", response.toString('hex'));
+  connection.write(response);
+}
+
 // Handler for ApiVersions API (API key 18)
 function handleApiVersions(connection, requestApiVersion, correlationId) {
   console.log("Handling ApiVersions request");
@@ -1004,6 +1057,9 @@ const server = net.createServer((connection) => {
     } else if (requestApiKey === 75) {
       // DescribeTopicPartitions API
       handleDescribeTopicPartitions(connection, data, correlationId);
+    } else if (requestApiKey === 1) {
+      // Fetch API
+      handleFetch(connection, requestApiVersion, correlationId, data);
     } else {
       console.log("Unknown API key:", requestApiKey);
     }

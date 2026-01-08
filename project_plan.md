@@ -733,17 +733,12 @@ responseBody.writeInt16BE(16, offset);  // max_version
 - Write events to partitions
 - Acknowledge successful writes
 
-### Stage 11: Fetch API
-- Allow consumers to read messages
-- Support offset-based reading
-- Implement batching
-
-### Stage 12: Message Storage
+### Stage 13: Message Storage
 - Persist messages to disk
 - Implement log segments
 - Support for log compaction
 
-### Stage 13: Replication (Advanced)
+### Stage 14: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication
@@ -1012,5 +1007,5 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 7 - Handle Known Topics with Metadata Parsing Complete
+**Current Stage:** Stage 9 - Advertise Fetch API Complete
 
