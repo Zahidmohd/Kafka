@@ -400,34 +400,218 @@ response.writeUInt8(0, 8); // TAG_BUFFER after correlation_id
 
 ---
 
+### ✅ Stage 7: Handle Known Topics with Metadata Parsing
+
+**Status:** COMPLETED
+
+**What it does:**
+- Reads and parses the Kafka cluster metadata log file
+- Extracts topic names, UUIDs, and partition information
+- Returns proper metadata for known topics (error_code=0, actual UUID, partition data)
+- Still returns error for unknown topics
+
+**Purpose:**
+This stage implements full topic metadata support by parsing Kafka's internal `__cluster_metadata` log file, allowing the broker to respond with actual topic and partition information.
+
+**Cluster Metadata Log:**
+- **Location**: `/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log`
+- **Format**: Kafka binary log format with record batches
+- **Contains**: Topic records, partition records, and cluster configuration
+
+**Binary Log Format Structure:**
+```
+Log File:
+├─ Record Entry 1:
+│  ├─ baseOffset (8 bytes, INT64)
+│  ├─ batchLength (4 bytes, INT32)
+│  └─ Record Batch:
+│     ├─ Header (61 bytes):
+│     │  ├─ partitionLeaderEpoch (4 bytes)
+│     │  ├─ magic (1 byte) = 2
+│     │  ├─ crc (4 bytes)
+│     │  ├─ attributes (2 bytes)
+│     │  ├─ lastOffsetDelta (4 bytes)
+│     │  ├─ timestamps (16 bytes)
+│     │  ├─ producer info (14 bytes)
+│     │  ├─ baseSequence (4 bytes)
+│     │  └─ recordsCount (4 bytes)
+│     └─ Records (variable):
+│        ├─ Record 1 (uses varints):
+│        │  ├─ length (varint)
+│        │  ├─ attributes (1 byte)
+│        │  ├─ timestampDelta (varint)
+│        │  ├─ offsetDelta (varint)
+│        │  ├─ keyLength (varint)
+│        │  ├─ key (bytes):
+│        │  │  ├─ frameVersion (1 byte)
+│        │  │  ├─ recordType (1 byte):
+│        │  │  │  ├─ 2 = TopicRecord
+│        │  │  │  └─ 3 = PartitionRecord
+│        │  │  └─ type-specific data
+│        │  ├─ valueLength (varint)
+│        │  └─ value (bytes)
+│        └─ Record 2, 3, ...
+└─ Record Entry 2, 3, ...
+```
+
+**Record Types:**
+
+1. **TopicRecord (type 2):**
+   - Contains: topic name, topic UUID
+   - Used to register new topics in the cluster
+
+2. **PartitionRecord (type 3):**
+   - Key: partition ID, topic UUID
+   - Value: replicas, ISR (in-sync replicas), leader
+
+**Varint Encoding:**
+- Variable-length integer encoding (1-5 bytes)
+- Uses zigzag encoding for signed integers
+- MSB (bit 7) = 1 means more bytes follow
+- LSB 7 bits contain data
+
+**Response for Known Topics:**
+```
+00 00 00 4a  // message_size:                 74 bytes
+ab cd ef 12  // correlation_id:               (from request)
+00           // TAG_BUFFER:                   empty (header v1)
+00 00 00 00  // throttle_time_ms:             0
+02           // topics array:                 1 element
+00 00        // error_code:                   0 (NO ERROR!) ✓
+04           // name length:                  3 (compact string)
+66 6f 6f     // name:                         "foo"
+a1 b2 c3 d4  // topic_id:                     (ACTUAL UUID!) ✓
+e5 f6 a7 b8  //                               (16 bytes)
+c9 d0 e1 f2  //
+a3 b4 c5 d6  //
+00           // is_internal:                  false
+02           // partitions array:             1 element ✓
+00 00        //   error_code:                 0
+00 00 00 00  //   partition_index:            0
+00 00 00 01  //   leader_id:                  1
+00 00 00 00  //   leader_epoch:               0
+02           //   replica_nodes:              1 element
+01           //     broker 1
+02           //   isr_nodes:                  1 element
+01           //     broker 1
+01           //   eligible_leader_replicas:   0 elements
+01           //   last_known_elr:             0 elements
+01           //   offline_replicas:           0 elements
+00           //   TAG_BUFFER:                 empty
+00 00 00 00  // topic_authorized_operations:  0
+00           // TAG_BUFFER:                   empty
+ff           // next_cursor:                  -1 (null)
+00           // TAG_BUFFER:                   empty
+```
+
+**Key Implementation Details:**
+
+1. **Metadata Storage:**
+   ```javascript
+   const topicsMetadata = new Map();
+   // Structure: Map<topicName, { name, id, partitions[] }>
+   ```
+
+2. **Varint Reading:**
+   ```javascript
+   function readVarint(buffer, offset) {
+     // Reads variable-length integers
+     // Handles zigzag encoding for signed values
+     // Returns [value, bytesRead]
+   }
+   ```
+
+3. **Dynamic Response Building:**
+   ```javascript
+   function buildDescribeTopicPartitionsBody(topicName, topicNameBytes, topicMetadata) {
+     // Builds response based on whether topic exists
+     // For known topics: includes actual UUID and partition data
+     // For unknown topics: error_code=3, zero UUID, no partitions
+   }
+   ```
+
+**Partition Information Fields:**
+- **partition_index**: Partition ID (0, 1, 2, ...)
+- **leader_id**: Broker ID that leads this partition
+- **leader_epoch**: Leadership generation number
+- **replica_nodes**: All brokers storing this partition
+- **isr_nodes**: In-sync replicas (up-to-date copies)
+- **eligible_leader_replicas**: Brokers eligible to become leader
+- **last_known_elr**: Last known eligible leaders
+- **offline_replicas**: Unavailable replicas
+
+**Key Concepts:**
+- **Kafka Log Format**: Binary format for storing records on disk
+- **Record Batches**: Group of related records for efficiency
+- **Varints**: Space-efficient integer encoding
+- **Magic Byte**: Version indicator (v2 = flexible records)
+- **CRC**: Checksum for data integrity
+- **Topic UUID**: Unique identifier for topics (separate from name)
+- **Replicas**: Copies of partition data across brokers
+- **ISR**: In-sync replicas that are caught up with leader
+- **Leader**: Primary broker handling reads/writes for a partition
+
+**Code Highlights:**
+```javascript
+// Parse cluster metadata on startup
+parseClusterMetadata();
+
+// Read and parse binary log file
+const logData = fs.readFileSync(logPath);
+const baseOffset = logData.readBigInt64BE(offset);
+const batchLength = logData.readInt32BE(offset);
+
+// Parse varint-encoded records
+const [length, lengthBytes] = readVarint(data, offset);
+
+// Extract topic UUID from TopicRecord
+const topicId = value.slice(offset, offset + 16);
+topicsMetadata.set(topicName, { name, id: topicId, partitions: [] });
+
+// Return actual metadata for known topics
+if (topicExists) {
+  responseBody.writeInt16BE(0, offset); // No error!
+  topicMetadata.id.copy(responseBody, offset); // Actual UUID!
+  // Include partition data...
+}
+```
+
+**Challenges Solved:**
+1. **Binary Format Parsing**: Decoding Kafka's custom log format
+2. **Varint Handling**: Reading variable-length integers
+3. **Record Type Identification**: Distinguishing TopicRecords from PartitionRecords
+4. **UUID Management**: Matching partitions to topics via UUID
+5. **Dynamic Response Building**: Different responses for known vs unknown topics
+
+---
+
 ## 🔮 Future Stages (To Be Implemented)
 
-### Stage 7: Handle Known Topics
-- Store topic metadata
-- Return actual topic information for known topics
-- Create topics dynamically
+### Stage 8: Handle Multiple Topics
+- Support multiple topics in a single request
+- Return metadata for multiple topics
 
-### Stage 8: Topic Management  
+### Stage 9: Topic Management  
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 9: Produce API
+### Stage 10: Produce API
 - Accept messages from producers
 - Write events to partitions
 - Acknowledge successful writes
 
-### Stage 10: Fetch API
+### Stage 11: Fetch API
 - Allow consumers to read messages
 - Support offset-based reading
 - Implement batching
 
-### Stage 11: Message Storage
+### Stage 12: Message Storage
 - Persist messages to disk
 - Implement log segments
 - Support for log compaction
 
-### Stage 12: Replication (Advanced)
+### Stage 13: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication
@@ -648,11 +832,30 @@ The CodeCrafters platform provides automated tests that verify:
    - Different response header versions for different APIs
 
 8. **Kafka Concepts**
-   - Topics and partitions (basic understanding)
+   - Topics and partitions (detailed understanding)
    - Topic metadata (name, ID, partitions)
    - Internal vs. external topics
    - Unknown topic handling
    - Topic UUIDs and identification
+   - Cluster metadata storage
+   - Partition replicas and ISR (in-sync replicas)
+   - Leader election and epochs
+   - Broker IDs and leadership
+
+9. **Binary File Parsing**
+   - Reading and parsing Kafka log files
+   - Kafka binary log format
+   - Record batches and individual records
+   - Varint encoding/decoding (variable-length integers)
+   - Zigzag encoding for signed integers
+   - Magic bytes and format versioning
+   - CRC checksums for data integrity
+
+10. **Advanced Data Structures**
+   - In-memory metadata storage (Map)
+   - Topic and partition relationships
+   - UUID handling (16-byte identifiers)
+   - Dynamic response building based on metadata state
 
 ---
 
@@ -677,5 +880,5 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 6 - DescribeTopicPartitions Implementation for Unknown Topics Complete
+**Current Stage:** Stage 7 - Handle Known Topics with Metadata Parsing Complete
 
