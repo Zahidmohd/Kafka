@@ -47,7 +47,7 @@ const server = net.createServer((connection) => {
     //   - throttle_time_ms (INT32): 4 bytes
     //   - TAG_BUFFER: 1 byte
     
-    const responseBody = Buffer.alloc(15);
+    const responseBody = Buffer.alloc(22);
     let offset = 0;
     
     // error_code (INT16): 0
@@ -56,16 +56,26 @@ const server = net.createServer((connection) => {
     
     // api_keys (COMPACT_ARRAY): length prefix + entries
     // COMPACT_ARRAY encoding: length is n+1 for array of n elements
-    // We have 1 entry, so we write 2
-    responseBody.writeUInt8(2, offset);
+    // We have 2 entries, so we write 3
+    responseBody.writeUInt8(3, offset);
     offset += 1;
     
-    // API key entry: ApiVersions (18)
+    // API key entry 1: ApiVersions (18)
     responseBody.writeInt16BE(18, offset); // api_key
     offset += 2;
     responseBody.writeInt16BE(0, offset);  // min_version
     offset += 2;
     responseBody.writeInt16BE(4, offset);  // max_version
+    offset += 2;
+    responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+    offset += 1;
+    
+    // API key entry 2: DescribeTopicPartitions (75)
+    responseBody.writeInt16BE(75, offset); // api_key
+    offset += 2;
+    responseBody.writeInt16BE(0, offset);  // min_version
+    offset += 2;
+    responseBody.writeInt16BE(0, offset);  // max_version
     offset += 2;
     responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
     offset += 1;
@@ -78,7 +88,7 @@ const server = net.createServer((connection) => {
     responseBody.writeUInt8(0, offset);
     offset += 1;
     
-    // Calculate message_size: header (4 bytes) + body (15 bytes) = 19 bytes
+    // Calculate message_size: header (4 bytes) + body (22 bytes) = 26 bytes
     const messageSize = 4 + responseBody.length;
     
     // Create full response
