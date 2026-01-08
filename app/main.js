@@ -11,6 +11,123 @@ const topicsMetadata = new Map();
 // Store transaction state in memory
 const transactions = new Map(); // transactionalId -> { producerId, producerEpoch, state, partitions }
 
+// Store replication state for high availability
+const replicationState = new Map(); // partitionKey -> { leader, followers, isr, lastUpdated }
+
+// Broker configuration
+const BROKER_ID = parseInt(process.env.BROKER_ID || '1');
+const REPLICATION_FACTOR = parseInt(process.env.REPLICATION_FACTOR || '1');
+
+console.log(`Broker ID: ${BROKER_ID}, Replication Factor: ${REPLICATION_FACTOR}`);
+
+// Helper: Initialize replication for a partition
+function initializeReplication(topicName, partitionIndex, replicationFactor) {
+  const partitionKey = `${topicName}-${partitionIndex}`;
+  
+  // Determine replicas (simplified: use broker IDs 1, 2, 3, ...)
+  const replicas = [];
+  for (let i = 0; i < replicationFactor; i++) {
+    replicas.push((i % 3) + 1); // Cycle through brokers 1, 2, 3
+  }
+  
+  // First replica is the leader
+  const leader = replicas[0];
+  
+  // All replicas start in-sync
+  const isr = [...replicas];
+  
+  replicationState.set(partitionKey, {
+    leader: leader,
+    replicas: replicas,
+    isr: isr,
+    followers: replicas.filter(r => r !== leader),
+    lastUpdated: Date.now()
+  });
+  
+  console.log(`Initialized replication for ${partitionKey}: leader=${leader}, replicas=[${replicas}], isr=[${isr}]`);
+  
+  return { leader, replicas, isr };
+}
+
+// Helper: Check if this broker is the leader for a partition
+function isLeader(topicName, partitionIndex) {
+  const partitionKey = `${topicName}-${partitionIndex}`;
+  const state = replicationState.get(partitionKey);
+  
+  if (!state) {
+    return true; // Default to leader if no replication state
+  }
+  
+  return state.leader === BROKER_ID;
+}
+
+// Helper: Update ISR (In-Sync Replicas) for a partition
+function updateISR(topicName, partitionIndex, replicaId, inSync) {
+  const partitionKey = `${topicName}-${partitionIndex}`;
+  const state = replicationState.get(partitionKey);
+  
+  if (!state) {
+    return;
+  }
+  
+  if (inSync && !state.isr.includes(replicaId)) {
+    state.isr.push(replicaId);
+    console.log(`Added replica ${replicaId} to ISR for ${partitionKey}`);
+  } else if (!inSync && state.isr.includes(replicaId)) {
+    state.isr = state.isr.filter(r => r !== replicaId);
+    console.log(`Removed replica ${replicaId} from ISR for ${partitionKey}`);
+  }
+  
+  state.lastUpdated = Date.now();
+}
+
+// Helper: Elect new leader if current leader fails
+function electLeader(topicName, partitionIndex) {
+  const partitionKey = `${topicName}-${partitionIndex}`;
+  const state = replicationState.get(partitionKey);
+  
+  if (!state || state.isr.length === 0) {
+    console.log(`Cannot elect leader for ${partitionKey}: no ISR replicas`);
+    return null;
+  }
+  
+  // Elect first replica in ISR as new leader
+  const newLeader = state.isr[0];
+  const oldLeader = state.leader;
+  
+  if (newLeader !== oldLeader) {
+    state.leader = newLeader;
+    state.followers = state.replicas.filter(r => r !== newLeader);
+    state.lastUpdated = Date.now();
+    
+    console.log(`Elected new leader for ${partitionKey}: ${oldLeader} → ${newLeader}`);
+  }
+  
+  return newLeader;
+}
+
+// Helper: Get replication info for a partition
+function getReplicationInfo(topicName, partitionIndex) {
+  const partitionKey = `${topicName}-${partitionIndex}`;
+  const state = replicationState.get(partitionKey);
+  
+  if (!state) {
+    return {
+      leader: BROKER_ID,
+      replicas: [BROKER_ID],
+      isr: [BROKER_ID],
+      isLeader: true
+    };
+  }
+  
+  return {
+    leader: state.leader,
+    replicas: state.replicas,
+    isr: state.isr,
+    isLeader: state.leader === BROKER_ID
+  };
+}
+
 // Helper: Read messages from partition log file
 function readPartitionLog(topicName, partitionId) {
   const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partitionId}`;
@@ -1394,9 +1511,17 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
       } else {
         console.log(`    ✓ Partition ${partition.index} exists`);
         
-        // Write record batch to disk if present
-        if (partition.recordBatch && partition.recordBatch.length > 0) {
-          console.log(`    Writing ${partition.recordBatch.length} bytes to partition log`);
+        // Check if this broker is the leader for this partition (replication)
+        const replicationInfo = getReplicationInfo(topic.name, partition.index);
+        
+        if (!replicationInfo.isLeader) {
+          console.log(`    ✗ NOT_LEADER_FOR_PARTITION: Leader is ${replicationInfo.leader}, this broker is ${BROKER_ID}`);
+          partition.errorCode = 6; // NOT_LEADER_FOR_PARTITION
+          partition.baseOffset = -1n;
+          partition.logAppendTimeMs = -1n;
+          partition.logStartOffset = -1n;
+        } else if (partition.recordBatch && partition.recordBatch.length > 0) {
+          console.log(`    Writing ${partition.recordBatch.length} bytes to partition log (Leader: ${replicationInfo.leader})`);
           const writeSuccess = writeRecordBatchToLog(
             topic.name,
             partition.index,
@@ -2098,6 +2223,8 @@ function handleCreateTopics(connection, requestApiVersion, correlationId, data) 
     let errorMessage = null;
     
     try {
+      const partitionMetadata = [];
+      
       for (let p = 0; p < numPartitions; p++) {
         const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${p}`;
         if (!fs.existsSync(partitionDir)) {
@@ -2111,19 +2238,24 @@ function handleCreateTopics(connection, requestApiVersion, correlationId, data) 
           fs.writeFileSync(logFile, Buffer.alloc(0));
           console.log(`    Created log file: ${logFile}`);
         }
+        
+        // Initialize replication for this partition
+        const replication = initializeReplication(topicName, p, replicationFactor);
+        
+        partitionMetadata.push({
+          partitionId: p,
+          leader: replication.leader,
+          replicas: replication.replicas,
+          isr: replication.isr,
+          leaderEpoch: 0
+        });
       }
       
-      // Store topic in metadata cache
+      // Store topic in metadata cache with replication info
       topicsMetadata.set(topicName, {
         name: topicName,
         id: topicId,
-        partitions: Array.from({ length: numPartitions }, (_, i) => ({
-          partitionId: i,
-          leader: 1,
-          replicas: [1],
-          isr: [1],
-          leaderEpoch: 0
-        }))
+        partitions: partitionMetadata
       });
       
       console.log(`  ✓ Successfully created topic "${topicName}"`);
