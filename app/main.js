@@ -1183,7 +1183,7 @@ function writeRecordBatchToLog(topicName, partitionIndex, recordBatch, baseOffse
   
   console.log(`Writing record batch to: ${logFile}`);
   console.log(`  Base offset: ${baseOffset}`);
-  console.log(`  Batch length: ${recordBatch.length}`);
+  console.log(`  Original batch length: ${recordBatch.length}`);
   
   try {
     // Create partition directory if it doesn't exist
@@ -1192,20 +1192,26 @@ function writeRecordBatchToLog(topicName, partitionIndex, recordBatch, baseOffse
       console.log(`  Created directory: ${partitionDir}`);
     }
     
-    // Prepare log entry: baseOffset (8 bytes) + batchLength (4 bytes) + recordBatch
-    const logEntry = Buffer.alloc(8 + 4 + recordBatch.length);
+    // The recordBatch from Produce request includes baseOffset (8) + batchLength (4) at the start
+    // We need to skip these 12 bytes and use our own baseOffset/batchLength for the log file
+    // The actual RecordBatch structure starts at byte 12
+    const actualRecordBatch = recordBatch.slice(12);
+    console.log(`  Actual record batch length (after skipping 12-byte header): ${actualRecordBatch.length}`);
+    
+    // Prepare log entry: baseOffset (8 bytes) + batchLength (4 bytes) + actualRecordBatch
+    const logEntry = Buffer.alloc(8 + 4 + actualRecordBatch.length);
     let offset = 0;
     
     // Write base offset (INT64)
     logEntry.writeBigInt64BE(BigInt(baseOffset), offset);
     offset += 8;
     
-    // Write batch length (INT32)
-    logEntry.writeInt32BE(recordBatch.length, offset);
+    // Write batch length (INT32) - length of actual record batch data
+    logEntry.writeInt32BE(actualRecordBatch.length, offset);
     offset += 4;
     
-    // Write record batch data
-    recordBatch.copy(logEntry, offset);
+    // Write actual record batch data (starting from partitionLeaderEpoch)
+    actualRecordBatch.copy(logEntry, offset);
     
     // Append to log file
     fs.appendFileSync(logFile, logEntry);
