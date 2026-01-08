@@ -1368,29 +1368,29 @@ Stage 16 will implement validation logic to check if topics/partitions actually 
 - Still no actual writing to disk yet
 - Implement proper offset tracking
 
-### Stage 16: Writing Messages to Disk
+### Stage 17: Writing Messages to Disk
 - Write record batches to partition log files
 - Update log file offsets
 - Maintain log integrity
 - Handle file rotation
 
-### Stage 17: Advanced Fetch Features
+### Stage 18: Advanced Fetch Features
 - Handle fetch offsets (start reading from specific position)
 - Support max bytes limit
 - Handle multiple partitions
 - Optimize large message handling
 
-### Stage 18: Topic Management  
+### Stage 19: Topic Management  
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 19: Message Compaction
+### Stage 20: Message Compaction
 - Support for log compaction
 - Implement cleanup policies
 - Optimize storage
 
-### Stage 20: Replication (Advanced)
+### Stage 21: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication
@@ -1659,6 +1659,6 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 15 - Produce Invalid Topics/Partitions Complete  
-**Total Lines of Code:** ~1,640 lines
+**Current Stage:** Stage 16 - Produce Success Responses Complete  
+**Total Lines of Code:** ~1,690 lines
 

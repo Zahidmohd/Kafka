@@ -1255,8 +1255,57 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
     });
   }
   
+  // Validate topics and partitions
+  console.log("\n=== Validating Topics and Partitions ===");
+  
+  for (const topic of requestTopics) {
+    console.log(`Validating topic: ${topic.name}`);
+    
+    // Look up topic in cluster metadata
+    const topicMetadata = findTopicInLog(topic.name);
+    
+    if (!topicMetadata || !topicMetadata.found) {
+      console.log(`  ✗ Topic "${topic.name}" not found`);
+      // Mark all partitions as invalid
+      for (const partition of topic.partitions) {
+        partition.errorCode = 3; // UNKNOWN_TOPIC_OR_PARTITION
+        partition.baseOffset = -1n;
+        partition.logAppendTimeMs = -1n;
+        partition.logStartOffset = -1n;
+      }
+      continue;
+    }
+    
+    console.log(`  ✓ Topic "${topic.name}" exists with ${topicMetadata.partitions.length} partitions`);
+    
+    // Validate each partition
+    for (const partition of topic.partitions) {
+      console.log(`  Validating partition ${partition.index}`);
+      
+      // Check if partition exists in topic metadata
+      const partitionMetadata = topicMetadata.partitions.find(
+        p => p.partitionIndex === partition.index
+      );
+      
+      if (!partitionMetadata) {
+        console.log(`    ✗ Partition ${partition.index} not found`);
+        partition.errorCode = 3; // UNKNOWN_TOPIC_OR_PARTITION
+        partition.baseOffset = -1n;
+        partition.logAppendTimeMs = -1n;
+        partition.logStartOffset = -1n;
+      } else {
+        console.log(`    ✓ Partition ${partition.index} exists`);
+        partition.errorCode = 0; // NO_ERROR
+        partition.baseOffset = 0n; // First record in partition
+        partition.logAppendTimeMs = -1n; // Latest timestamp
+        partition.logStartOffset = 0n; // Start of log
+      }
+    }
+  }
+  
+  console.log("=== Validation Complete ===\n");
+  
   // Build Produce v11 response
-  // For this stage, return error code 3 (UNKNOWN_TOPIC_OR_PARTITION) for all topics/partitions
   
   // Calculate response body size
   let bodySize = 0;
@@ -1327,20 +1376,20 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
       response.writeInt32BE(partition.index, responseOffset);
       responseOffset += 4;
       
-      // error_code (INT16): 3 = UNKNOWN_TOPIC_OR_PARTITION
-      response.writeInt16BE(3, responseOffset);
+      // error_code (INT16): use validated error code
+      response.writeInt16BE(partition.errorCode, responseOffset);
       responseOffset += 2;
       
-      // base_offset (INT64): -1
-      response.writeBigInt64BE(-1n, responseOffset);
+      // base_offset (INT64): use validated offset
+      response.writeBigInt64BE(partition.baseOffset, responseOffset);
       responseOffset += 8;
       
-      // log_append_time_ms (INT64): -1
-      response.writeBigInt64BE(-1n, responseOffset);
+      // log_append_time_ms (INT64): use validated timestamp
+      response.writeBigInt64BE(partition.logAppendTimeMs, responseOffset);
       responseOffset += 8;
       
-      // log_start_offset (INT64): -1
-      response.writeBigInt64BE(-1n, responseOffset);
+      // log_start_offset (INT64): use validated offset
+      response.writeBigInt64BE(partition.logStartOffset, responseOffset);
       responseOffset += 8;
       
       // record_errors (COMPACT_ARRAY): empty
