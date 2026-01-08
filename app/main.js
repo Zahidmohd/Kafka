@@ -339,7 +339,7 @@ function parseTopicRecord(value) {
 
 // Build DescribeTopicPartitions response body
 function buildDescribeTopicPartitionsBody(topicName, topicNameBytes, topicMetadata) {
-  const topicExists = topicMetadata !== undefined;
+  const topicExists = topicMetadata !== undefined && topicMetadata !== null;
   
   // Calculate body size
   let bodySize = 4 + 1; // throttle_time_ms + topics array length
@@ -348,7 +348,7 @@ function buildDescribeTopicPartitionsBody(topicName, topicNameBytes, topicMetada
   bodySize += 16; // topic_id (UUID)
   bodySize += 1; // is_internal
   
-  if (topicExists && topicMetadata.partitions.length > 0) {
+  if (topicExists && topicMetadata.partitions && topicMetadata.partitions.length > 0) {
     // Partitions array with actual partition data
     bodySize += 1; // partitions array length
     for (const partition of topicMetadata.partitions) {
@@ -407,7 +407,7 @@ function buildDescribeTopicPartitionsBody(topicName, topicNameBytes, topicMetada
   offset += 1;
   
   // partitions (COMPACT_ARRAY)
-  if (topicExists && topicMetadata.partitions.length > 0) {
+  if (topicExists && topicMetadata.partitions && topicMetadata.partitions.length > 0) {
     // Array with actual partitions
     responseBody.writeUInt8(topicMetadata.partitions.length + 1, offset);
     offset += 1;
