@@ -1559,16 +1559,16 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   }
   
   // Build ApiVersions v4 response body
-  // Body size: error_code(2) + array_length(1) + 4*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 36 bytes
-  const responseBody = Buffer.alloc(36);
+  // Body size: error_code(2) + array_length(1) + 6*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 50 bytes
+  const responseBody = Buffer.alloc(50);
   let offset = 0;
   
   // error_code (INT16): 0
   responseBody.writeInt16BE(0, offset);
   offset += 2;
   
-  // api_keys (COMPACT_ARRAY): 4 entries = 5 in compact encoding
-  responseBody.writeUInt8(5, offset);
+  // api_keys (COMPACT_ARRAY): 6 entries = 7 in compact encoding
+  responseBody.writeUInt8(7, offset);
   offset += 1;
   
   // API key entry 1: Produce (0)
@@ -1601,7 +1601,27 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 4: DescribeTopicPartitions (75)
+  // API key entry 4: CreateTopics (19)
+  responseBody.writeInt16BE(19, offset); // api_key
+  offset += 2;
+  responseBody.writeInt16BE(0, offset);  // min_version
+  offset += 2;
+  responseBody.writeInt16BE(7, offset);  // max_version
+  offset += 2;
+  responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+  offset += 1;
+  
+  // API key entry 5: DeleteTopics (20)
+  responseBody.writeInt16BE(20, offset); // api_key
+  offset += 2;
+  responseBody.writeInt16BE(0, offset);  // min_version
+  offset += 2;
+  responseBody.writeInt16BE(6, offset);  // max_version
+  offset += 2;
+  responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+  offset += 1;
+  
+  // API key entry 6: DescribeTopicPartitions (75)
   responseBody.writeInt16BE(75, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -1749,6 +1769,368 @@ function handleDescribeTopicPartitions(connection, data, correlationId) {
   connection.write(response);
 }
 
+// Handler for CreateTopics API (API key 19)
+function handleCreateTopics(connection, requestApiVersion, correlationId, data) {
+  console.log("Handling CreateTopics request");
+  
+  // Parse CreateTopics request
+  let offset = 12; // Skip message_size, api_key, api_version, correlation_id
+  
+  // Parse client_id (NULLABLE_STRING)
+  const clientIdLength = data.readInt16BE(offset);
+  offset += 2;
+  if (clientIdLength > 0) {
+    offset += clientIdLength;
+  }
+  
+  // TAG_BUFFER (header)
+  offset += 1;
+  
+  // Parse request body
+  // topics (COMPACT_ARRAY)
+  const topicsArrayLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  
+  console.log(`Creating ${topicsArrayLength} topic(s)`);
+  
+  const createdTopics = [];
+  
+  for (let i = 0; i < topicsArrayLength; i++) {
+    // name (COMPACT_STRING)
+    const nameLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    const topicName = data.toString('utf8', offset, offset + nameLength);
+    offset += nameLength;
+    
+    // num_partitions (INT32)
+    const numPartitions = data.readInt32BE(offset);
+    offset += 4;
+    
+    // replication_factor (INT16)
+    const replicationFactor = data.readInt16BE(offset);
+    offset += 2;
+    
+    console.log(`  Topic: ${topicName}, Partitions: ${numPartitions}, Replication: ${replicationFactor}`);
+    
+    // assignments (COMPACT_ARRAY) - skip for now
+    const assignmentsLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    // Skip assignments parsing
+    
+    // configs (COMPACT_ARRAY) - skip for now
+    const configsLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    // Skip configs parsing
+    
+    // TAG_BUFFER (topic)
+    offset += 1;
+    
+    // Create the topic
+    const topicId = Buffer.alloc(16);
+    // Generate a simple UUID (in production, use proper UUID generation)
+    for (let j = 0; j < 16; j++) {
+      topicId[j] = Math.floor(Math.random() * 256);
+    }
+    
+    // Create partition directories
+    let errorCode = 0;
+    let errorMessage = null;
+    
+    try {
+      for (let p = 0; p < numPartitions; p++) {
+        const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${p}`;
+        if (!fs.existsSync(partitionDir)) {
+          fs.mkdirSync(partitionDir, { recursive: true });
+          console.log(`    Created partition directory: ${partitionDir}`);
+        }
+        
+        // Create empty log file
+        const logFile = `${partitionDir}/00000000000000000000.log`;
+        if (!fs.existsSync(logFile)) {
+          fs.writeFileSync(logFile, Buffer.alloc(0));
+          console.log(`    Created log file: ${logFile}`);
+        }
+      }
+      
+      // Store topic in metadata cache
+      topicsMetadata.set(topicName, {
+        name: topicName,
+        id: topicId,
+        partitions: Array.from({ length: numPartitions }, (_, i) => ({
+          partitionId: i,
+          leader: 1,
+          replicas: [1],
+          isr: [1],
+          leaderEpoch: 0
+        }))
+      });
+      
+      console.log(`  ✓ Successfully created topic "${topicName}"`);
+    } catch (err) {
+      console.error(`  ✗ Error creating topic "${topicName}":`, err.message);
+      errorCode = 49; // INVALID_TOPIC_EXCEPTION
+      errorMessage = err.message;
+    }
+    
+    createdTopics.push({
+      name: topicName,
+      topicId: topicId,
+      errorCode: errorCode,
+      errorMessage: errorMessage,
+      numPartitions: numPartitions,
+      replicationFactor: replicationFactor
+    });
+  }
+  
+  // Build response
+  // Calculate body size
+  let bodySize = 4; // throttle_time_ms
+  bodySize += 1; // topics array length
+  
+  for (const topic of createdTopics) {
+    bodySize += 1; // name length
+    bodySize += topic.name.length; // name
+    bodySize += 16; // topic_id (UUID)
+    bodySize += 2; // error_code
+    bodySize += 1; // error_message (null = 0)
+    bodySize += 4; // num_partitions
+    bodySize += 2; // replication_factor
+    bodySize += 1; // configs array (empty)
+    bodySize += 1; // TAG_BUFFER
+  }
+  
+  bodySize += 1; // TAG_BUFFER (final)
+  
+  const headerSize = 4 + 1; // correlation_id + TAG_BUFFER
+  const response = Buffer.alloc(4 + headerSize + bodySize);
+  let responseOffset = 0;
+  
+  // message_size
+  response.writeInt32BE(headerSize + bodySize, responseOffset);
+  responseOffset += 4;
+  
+  // Response Header v1
+  response.writeInt32BE(correlationId, responseOffset);
+  responseOffset += 4;
+  response.writeUInt8(0, responseOffset); // TAG_BUFFER
+  responseOffset += 1;
+  
+  // Response Body
+  // throttle_time_ms
+  response.writeInt32BE(0, responseOffset);
+  responseOffset += 4;
+  
+  // topics array
+  response.writeUInt8(createdTopics.length + 1, responseOffset);
+  responseOffset += 1;
+  
+  for (const topic of createdTopics) {
+    // name
+    response.writeUInt8(topic.name.length + 1, responseOffset);
+    responseOffset += 1;
+    response.write(topic.name, responseOffset, 'utf8');
+    responseOffset += topic.name.length;
+    
+    // topic_id
+    topic.topicId.copy(response, responseOffset);
+    responseOffset += 16;
+    
+    // error_code
+    response.writeInt16BE(topic.errorCode, responseOffset);
+    responseOffset += 2;
+    
+    // error_message (null)
+    response.writeUInt8(0, responseOffset);
+    responseOffset += 1;
+    
+    // num_partitions
+    response.writeInt32BE(topic.numPartitions, responseOffset);
+    responseOffset += 4;
+    
+    // replication_factor
+    response.writeInt16BE(topic.replicationFactor, responseOffset);
+    responseOffset += 2;
+    
+    // configs (empty array)
+    response.writeUInt8(1, responseOffset);
+    responseOffset += 1;
+    
+    // TAG_BUFFER
+    response.writeUInt8(0, responseOffset);
+    responseOffset += 1;
+  }
+  
+  // TAG_BUFFER (final)
+  response.writeUInt8(0, responseOffset);
+  responseOffset += 1;
+  
+  console.log("Sending CreateTopics response:", response.toString('hex'));
+  connection.write(response);
+}
+
+// Handler for DeleteTopics API (API key 20)
+function handleDeleteTopics(connection, requestApiVersion, correlationId, data) {
+  console.log("Handling DeleteTopics request");
+  
+  // Parse DeleteTopics request
+  let offset = 12; // Skip message_size, api_key, api_version, correlation_id
+  
+  // Parse client_id (NULLABLE_STRING)
+  const clientIdLength = data.readInt16BE(offset);
+  offset += 2;
+  if (clientIdLength > 0) {
+    offset += clientIdLength;
+  }
+  
+  // TAG_BUFFER (header)
+  offset += 1;
+  
+  // Parse request body
+  // topics (COMPACT_ARRAY)
+  const topicsArrayLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  
+  console.log(`Deleting ${topicsArrayLength} topic(s)`);
+  
+  const deletedTopics = [];
+  
+  for (let i = 0; i < topicsArrayLength; i++) {
+    // name (COMPACT_STRING)
+    const nameLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    const topicName = data.toString('utf8', offset, offset + nameLength);
+    offset += nameLength;
+    
+    // TAG_BUFFER (topic)
+    offset += 1;
+    
+    console.log(`  Topic: ${topicName}`);
+    
+    // Delete the topic
+    let errorCode = 0;
+    let errorMessage = null;
+    const topicId = Buffer.alloc(16); // Will be filled if topic exists
+    
+    try {
+      const metadata = topicsMetadata.get(topicName);
+      
+      if (!metadata) {
+        errorCode = 3; // UNKNOWN_TOPIC_OR_PARTITION
+        errorMessage = "Topic does not exist";
+        console.log(`    ✗ Topic "${topicName}" not found`);
+      } else {
+        metadata.id.copy(topicId);
+        
+        // Delete partition directories
+        for (const partition of metadata.partitions) {
+          const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partition.partitionId}`;
+          if (fs.existsSync(partitionDir)) {
+            // Delete log file first
+            const logFile = `${partitionDir}/00000000000000000000.log`;
+            if (fs.existsSync(logFile)) {
+              fs.unlinkSync(logFile);
+            }
+            // Delete directory
+            fs.rmdirSync(partitionDir);
+            console.log(`    Deleted partition directory: ${partitionDir}`);
+          }
+        }
+        
+        // Remove from metadata cache
+        topicsMetadata.delete(topicName);
+        
+        console.log(`  ✓ Successfully deleted topic "${topicName}"`);
+      }
+    } catch (err) {
+      console.error(`  ✗ Error deleting topic "${topicName}":`, err.message);
+      errorCode = 49; // INVALID_TOPIC_EXCEPTION
+      errorMessage = err.message;
+    }
+    
+    deletedTopics.push({
+      name: topicName,
+      topicId: topicId,
+      errorCode: errorCode,
+      errorMessage: errorMessage
+    });
+  }
+  
+  // timeout_ms (INT32) - skip
+  offset += 4;
+  
+  // TAG_BUFFER
+  offset += 1;
+  
+  // Build response
+  let bodySize = 4; // throttle_time_ms
+  bodySize += 1; // results array length
+  
+  for (const topic of deletedTopics) {
+    bodySize += 1; // name length
+    bodySize += topic.name.length; // name
+    bodySize += 16; // topic_id (UUID)
+    bodySize += 2; // error_code
+    bodySize += 1; // error_message (null = 0)
+    bodySize += 1; // TAG_BUFFER
+  }
+  
+  bodySize += 1; // TAG_BUFFER (final)
+  
+  const headerSize = 4 + 1; // correlation_id + TAG_BUFFER
+  const response = Buffer.alloc(4 + headerSize + bodySize);
+  let responseOffset = 0;
+  
+  // message_size
+  response.writeInt32BE(headerSize + bodySize, responseOffset);
+  responseOffset += 4;
+  
+  // Response Header v1
+  response.writeInt32BE(correlationId, responseOffset);
+  responseOffset += 4;
+  response.writeUInt8(0, responseOffset); // TAG_BUFFER
+  responseOffset += 1;
+  
+  // Response Body
+  // throttle_time_ms
+  response.writeInt32BE(0, responseOffset);
+  responseOffset += 4;
+  
+  // results array
+  response.writeUInt8(deletedTopics.length + 1, responseOffset);
+  responseOffset += 1;
+  
+  for (const topic of deletedTopics) {
+    // name
+    response.writeUInt8(topic.name.length + 1, responseOffset);
+    responseOffset += 1;
+    response.write(topic.name, responseOffset, 'utf8');
+    responseOffset += topic.name.length;
+    
+    // topic_id
+    topic.topicId.copy(response, responseOffset);
+    responseOffset += 16;
+    
+    // error_code
+    response.writeInt16BE(topic.errorCode, responseOffset);
+    responseOffset += 2;
+    
+    // error_message (null)
+    response.writeUInt8(0, responseOffset);
+    responseOffset += 1;
+    
+    // TAG_BUFFER
+    response.writeUInt8(0, responseOffset);
+    responseOffset += 1;
+  }
+  
+  // TAG_BUFFER (final)
+  response.writeUInt8(0, responseOffset);
+  responseOffset += 1;
+  
+  console.log("Sending DeleteTopics response:", response.toString('hex'));
+  connection.write(response);
+}
+
 const server = net.createServer((connection) => {
   console.log("Client connected");
   
@@ -1780,6 +2162,12 @@ const server = net.createServer((connection) => {
     } else if (requestApiKey === 18) {
       // ApiVersions API
       handleApiVersions(connection, requestApiVersion, correlationId);
+    } else if (requestApiKey === 19) {
+      // CreateTopics API
+      handleCreateTopics(connection, requestApiVersion, correlationId, data);
+    } else if (requestApiKey === 20) {
+      // DeleteTopics API
+      handleDeleteTopics(connection, requestApiVersion, correlationId, data);
     } else if (requestApiKey === 75) {
       // DescribeTopicPartitions API
       handleDescribeTopicPartitions(connection, data, correlationId);
