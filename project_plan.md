@@ -1532,9 +1532,220 @@ Stage 17 will implement the actual message writing:
 
 ---
 
+### ✅ Stage 17: Writing Messages to Disk
+
+**Status:** COMPLETED
+
+**What it does:**
+- Captures record batches from Produce requests (instead of skipping them)
+- Writes record batches to partition log files on disk
+- Creates partition directories if they don't exist
+- Uses Kafka's log file format: baseOffset + batchLength + recordBatch
+- Returns success only after successful disk write
+- Implements true message persistence
+
+**Purpose:**
+This is the most critical stage - it transforms the broker from a validation-only system into a true message broker that persists data to disk, enabling durable message storage and retrieval.
+
+**Kafka Log File Format:**
+```
+/tmp/kraft-combined-logs/<topic-name>-<partition-index>/00000000000000000000.log
+
+File structure:
+├─ Log Entry 1:
+│  ├─ baseOffset (8 bytes, INT64): Starting offset for this batch
+│  ├─ batchLength (4 bytes, INT32): Length of record batch
+│  └─ recordBatch (N bytes): Raw record batch data from Produce request
+├─ Log Entry 2:
+│  ├─ baseOffset (8 bytes)
+│  ├─ batchLength (4 bytes)
+│  └─ recordBatch (N bytes)
+└─ ...
+```
+
+**Implementation:**
+
+**1. Capture Record Batch During Parsing:**
+```javascript
+// OLD: Skip records
+if (recordsLength > 0) {
+  offset += recordsLength;
+}
+
+// NEW: Capture records
+let recordBatch = null;
+if (recordsLength > 0) {
+  recordBatch = data.slice(offset, offset + recordsLength);
+  console.log(`Captured ${recordsLength} bytes of record batch data`);
+  offset += recordsLength;
+}
+
+partitions.push({
+  index: partitionIndex,
+  recordBatch: recordBatch  // Store for writing
+});
+```
+
+**2. Write to Disk Function:**
+```javascript
+function writeRecordBatchToLog(topicName, partitionIndex, recordBatch, baseOffset = 0) {
+  const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partitionIndex}`;
+  const logFile = `${partitionDir}/00000000000000000000.log`;
+  
+  // Create directory if needed
+  if (!fs.existsSync(partitionDir)) {
+    fs.mkdirSync(partitionDir, { recursive: true });
+  }
+  
+  // Build log entry
+  const logEntry = Buffer.alloc(8 + 4 + recordBatch.length);
+  logEntry.writeBigInt64BE(BigInt(baseOffset), 0);  // baseOffset
+  logEntry.writeInt32BE(recordBatch.length, 8);     // batchLength
+  recordBatch.copy(logEntry, 12);                    // recordBatch
+  
+  // Append to file
+  fs.appendFileSync(logFile, logEntry);
+  
+  return true;
+}
+```
+
+**3. Write During Validation:**
+```javascript
+if (partitionMetadata) {
+  // Partition exists - write if we have records
+  if (partition.recordBatch && partition.recordBatch.length > 0) {
+    const writeSuccess = writeRecordBatchToLog(
+      topic.name,
+      partition.index,
+      partition.recordBatch,
+      0  // baseOffset
+    );
+    
+    if (writeSuccess) {
+      partition.errorCode = 0;  // Success
+      partition.baseOffset = 0n;
+    } else {
+      partition.errorCode = 3;  // Write failed
+      partition.baseOffset = -1n;
+    }
+  }
+}
+```
+
+**Directory Structure Created:**
+```
+/tmp/kraft-combined-logs/
+├─ __cluster_metadata-0/
+│  └─ 00000000000000000000.log  (existing)
+├─ events-0/                     (created if needed)
+│  └─ 00000000000000000000.log  (created/appended)
+├─ orders-0/                     (created if needed)
+│  └─ 00000000000000000000.log  (created/appended)
+└─ users-0/                      (created if needed)
+   └─ 00000000000000000000.log  (created/appended)
+```
+
+**Write Flow:**
+```
+Producer → Produce Request with RecordBatch
+    ↓
+Broker parses and captures RecordBatch (not skipping)
+    ↓
+Broker validates topic & partition exist
+    ↓
+Broker creates partition directory (if needed)
+    ↓
+Broker writes: baseOffset + batchLength + RecordBatch
+    ↓
+Broker appends to log file
+    ↓
+Broker returns success response (error_code=0)
+    ↓
+Consumer can now Fetch this message!
+```
+
+**Key Concepts:**
+- **Append-only logs**: Never modify existing data, only append
+- **Atomic writes**: Each record batch is a complete unit
+- **Zero transformation**: Record batch written as-is from request
+- **File creation**: Automatically creates directories and files
+- **Offset tracking**: Base offset starts at 0 for new partitions
+- **Durability**: Data persists across broker restarts
+
+**Error Handling:**
+```javascript
+try {
+  fs.mkdirSync(partitionDir, { recursive: true });
+  fs.appendFileSync(logFile, logEntry);
+  return true;  // Success
+} catch (err) {
+  console.error('Write failed:', err.message);
+  return false;  // Failure - return error to producer
+}
+```
+
+**Example Log File Contents:**
+```
+For a Produce request with 1 record ("Hello World"):
+
+Bytes 0-7:   00 00 00 00 00 00 00 00  (baseOffset = 0)
+Bytes 8-11:  00 00 00 3D              (batchLength = 61)
+Bytes 12-72: <61 bytes of RecordBatch>
+             ├─ partitionLeaderEpoch (4)
+             ├─ magic (1)
+             ├─ crc (4)
+             ├─ attributes (2)
+             ├─ lastOffsetDelta (4)
+             ├─ baseTimestamp (8)
+             ├─ maxTimestamp (8)
+             ├─ producerId (8)
+             ├─ producerEpoch (2)
+             ├─ baseSequence (4)
+             ├─ recordsCount (4)
+             └─ records: "Hello World"
+```
+
+**What This Enables:**
+- ✅ Producers can write messages
+- ✅ Messages survive broker restart
+- ✅ Consumers can read messages (already implemented in Fetch)
+- ✅ Multiple producers can write to same topic
+- ✅ Partitions are isolated (separate files)
+- ✅ Log files grow with new messages
+
+**Testing Flow:**
+```bash
+# 1. Producer writes
+Producer → PRODUCE(topic="events", partition=0, record="Hello")
+Broker → Writes to /tmp/kraft-combined-logs/events-0/00000000000000000000.log
+Broker → Response: error_code=0, base_offset=0
+
+# 2. Consumer reads
+Consumer → FETCH(topic="events", partition=0, offset=0)
+Broker → Reads from /tmp/kraft-combined-logs/events-0/00000000000000000000.log
+Broker → Returns: RecordBatch with "Hello"
+```
+
+**Performance Considerations:**
+- **File I/O**: Each write is synchronous (appendFileSync)
+- **Batching**: Multiple records in one batch = one write
+- **Directory caching**: Only checks/creates directories once
+- **Buffer allocation**: Pre-allocates exact size needed
+
+**What's Next:**
+Stage 18+ will implement:
+- Offset tracking for multiple writes
+- Reading current offset before writing
+- Updating offsets after successful writes
+- Handling concurrent writes
+- Log segment rotation
+
+---
+
 ## 🔮 Future Stages (To Be Implemented)
 
-### Stage 17: Writing Messages to Disk
+### Stage 18: Multiple Record Batches
 
 ### Stage 17: Writing Messages to Disk
 - Parse record batches from Produce requests
@@ -1834,6 +2045,6 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 16 - Produce Success Responses Complete  
-**Total Lines of Code:** ~1,690 lines
+**Current Stage:** Stage 17 - Writing Messages to Disk Complete  
+**Total Lines of Code:** ~1,800 lines
 

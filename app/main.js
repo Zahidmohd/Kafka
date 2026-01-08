@@ -1176,6 +1176,48 @@ function buildFetchResponseBody(requestedTopics) {
   return responseBody;
 }
 
+// Helper: Write record batch to partition log file
+function writeRecordBatchToLog(topicName, partitionIndex, recordBatch, baseOffset = 0) {
+  const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partitionIndex}`;
+  const logFile = `${partitionDir}/00000000000000000000.log`;
+  
+  console.log(`Writing record batch to: ${logFile}`);
+  console.log(`  Base offset: ${baseOffset}`);
+  console.log(`  Batch length: ${recordBatch.length}`);
+  
+  try {
+    // Create partition directory if it doesn't exist
+    if (!fs.existsSync(partitionDir)) {
+      fs.mkdirSync(partitionDir, { recursive: true });
+      console.log(`  Created directory: ${partitionDir}`);
+    }
+    
+    // Prepare log entry: baseOffset (8 bytes) + batchLength (4 bytes) + recordBatch
+    const logEntry = Buffer.alloc(8 + 4 + recordBatch.length);
+    let offset = 0;
+    
+    // Write base offset (INT64)
+    logEntry.writeBigInt64BE(BigInt(baseOffset), offset);
+    offset += 8;
+    
+    // Write batch length (INT32)
+    logEntry.writeInt32BE(recordBatch.length, offset);
+    offset += 4;
+    
+    // Write record batch data
+    recordBatch.copy(logEntry, offset);
+    
+    // Append to log file
+    fs.appendFileSync(logFile, logEntry);
+    
+    console.log(`  ✓ Successfully wrote ${logEntry.length} bytes to log file`);
+    return true;
+  } catch (err) {
+    console.error(`  ✗ Error writing to log file:`, err.message);
+    return false;
+  }
+}
+
 // Handler for Produce API (API key 0)
 function handleProduce(connection, requestApiVersion, correlationId, data) {
   console.log("Handling Produce request");
@@ -1262,8 +1304,11 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
       
       console.log(`  Records length: ${recordsLength}`);
       
-      // Skip the records data
+      // Capture the records data (RecordBatch)
+      let recordBatch = null;
       if (recordsLength > 0) {
+        recordBatch = data.slice(offset, offset + recordsLength);
+        console.log(`  Captured ${recordsLength} bytes of record batch data`);
         offset += recordsLength;
       }
       
@@ -1271,7 +1316,8 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
       offset += 1;
       
       partitions.push({
-        index: partitionIndex
+        index: partitionIndex,
+        recordBatch: recordBatch  // Store the record batch
       });
     }
     
@@ -1324,10 +1370,37 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
         partition.logStartOffset = -1n;
       } else {
         console.log(`    ✓ Partition ${partition.index} exists`);
-        partition.errorCode = 0; // NO_ERROR
-        partition.baseOffset = 0n; // First record in partition
-        partition.logAppendTimeMs = -1n; // Latest timestamp
-        partition.logStartOffset = 0n; // Start of log
+        
+        // Write record batch to disk if present
+        if (partition.recordBatch && partition.recordBatch.length > 0) {
+          console.log(`    Writing ${partition.recordBatch.length} bytes to partition log`);
+          const writeSuccess = writeRecordBatchToLog(
+            topic.name,
+            partition.index,
+            partition.recordBatch,
+            0  // baseOffset = 0 (first record)
+          );
+          
+          if (writeSuccess) {
+            partition.errorCode = 0; // NO_ERROR
+            partition.baseOffset = 0n; // First record in partition
+            partition.logAppendTimeMs = -1n; // Latest timestamp
+            partition.logStartOffset = 0n; // Start of log
+          } else {
+            // Write failed
+            partition.errorCode = 3; // Return error if write fails
+            partition.baseOffset = -1n;
+            partition.logAppendTimeMs = -1n;
+            partition.logStartOffset = -1n;
+          }
+        } else {
+          // No records to write, but partition is valid
+          console.log(`    No records to write`);
+          partition.errorCode = 0; // NO_ERROR
+          partition.baseOffset = 0n;
+          partition.logAppendTimeMs = -1n;
+          partition.logStartOffset = 0n;
+        }
       }
     }
   }
