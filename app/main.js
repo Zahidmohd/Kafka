@@ -137,13 +137,13 @@ function parseRecord(data, startOffset) {
     let offset = startOffset;
     
     // Record format uses varints
-    // length (varint)
+    // length (varint - zigzag encoded)
     // attributes (int8)
-    // timestampDelta (varint)
-    // offsetDelta (varint)
-    // keyLength (varint)
+    // timestampDelta (varint - zigzag)
+    // offsetDelta (varint - zigzag)
+    // keyLength (varint - zigzag)
     // key (bytes)
-    // valueLength (varint)
+    // valueLength (varint - zigzag)
     // value (bytes)
     // headers count (varint)
     
@@ -180,11 +180,11 @@ function parseRecord(data, startOffset) {
         const frameVersion = key.readUInt8(0);
         recordType = key.readUInt8(1);
       }
+    } else if (keyLength < 0) {
+      // Negative length means null key, don't skip
     } else {
       // Skip past key if present
-      if (keyLength > 0) {
-        offset += keyLength;
-      }
+      offset += keyLength;
     }
     
     const [valueLength, vlBytes] = readVarint(data, offset);
@@ -211,8 +211,8 @@ function parseRecord(data, startOffset) {
   }
 }
 
-// Read a varint from buffer
-function readVarint(buffer, offset) {
+// Read an unsigned varint from buffer
+function readUnsignedVarint(buffer, offset) {
   let value = 0;
   let shift = 0;
   let bytesRead = 0;
@@ -228,9 +228,15 @@ function readVarint(buffer, offset) {
     shift += 7;
   }
   
-  // Handle zigzag encoding for signed varints
-  const unsigned = value >>> 1;
-  return [(value & 1) ? ~unsigned : unsigned, bytesRead];
+  return [value, bytesRead];
+}
+
+// Read a signed varint from buffer (with zigzag encoding)
+function readVarint(buffer, offset) {
+  const [unsignedValue, bytesRead] = readUnsignedVarint(buffer, offset);
+  // Zigzag decoding: (n >>> 1) ^ -(n & 1)
+  const value = (unsignedValue >>> 1) ^ -(unsignedValue & 1);
+  return [value, bytesRead];
 }
 
 // Parse a TopicRecord
@@ -242,10 +248,11 @@ function parseTopicRecord(value) {
     const frameVersion = value.readUInt8(0);
     let offset = 1;
     
-    // Read topic name (string with varint length in metadata records)
-    const [nameLength, nlBytes] = readVarint(value, offset);
+    // Read topic name (COMPACT_STRING: unsigned varint length+1, then bytes)
+    const [nameLengthPlusOne, nlBytes] = readUnsignedVarint(value, offset);
     offset += nlBytes;
     
+    const nameLength = nameLengthPlusOne - 1;
     if (nameLength <= 0 || offset + nameLength > value.length) {
       console.log(`    Invalid topic name length: ${nameLength}`);
       return;
@@ -275,7 +282,7 @@ function parseTopicRecord(value) {
       topicsMetadata.get(topicName).id = topicId;
     }
   } catch (err) {
-    console.log("    Error parsing TopicRecord:", err.message, err.stack);
+    console.log("    Error parsing TopicRecord:", err.message);
   }
 }
 
@@ -470,9 +477,10 @@ function parsePartitionRecord(key, value) {
     
     let valueOffset = 1; // Skip frame version
     
-    // Read replicas array (varint count, then varint values)
-    const [replicaCount, rcBytes] = readVarint(value, valueOffset);
+    // Read replicas array (COMPACT_ARRAY: unsigned varint count-1, then signed varint values)
+    const [replicaCountPlusOne, rcBytes] = readUnsignedVarint(value, valueOffset);
     valueOffset += rcBytes;
+    const replicaCount = replicaCountPlusOne - 1;
     
     const replicas = [];
     for (let i = 0; i < replicaCount && valueOffset < value.length; i++) {
@@ -481,9 +489,10 @@ function parsePartitionRecord(key, value) {
       replicas.push(replica);
     }
     
-    // Read ISR array (varint count, then varint values)
-    const [isrCount, icBytes] = readVarint(value, valueOffset);
+    // Read ISR array (COMPACT_ARRAY)
+    const [isrCountPlusOne, icBytes] = readUnsignedVarint(value, valueOffset);
     valueOffset += icBytes;
+    const isrCount = isrCountPlusOne - 1;
     
     const isr = [];
     for (let i = 0; i < isrCount && valueOffset < value.length; i++) {
@@ -492,33 +501,33 @@ function parsePartitionRecord(key, value) {
       isr.push(replica);
     }
     
-    // There might be more fields, but for now skip to leader
-    // Try to read leader - it might be further in
+    // There might be more fields - try to read them
     let leader = replicas.length > 0 ? replicas[0] : 1;
     
     // Try reading more fields if available
     if (valueOffset < value.length) {
-      // Skip some fields and try to get leader
       try {
-        // removingReplicas array
-        const [removingCount, remBytes] = readVarint(value, valueOffset);
+        // removingReplicas array (COMPACT_ARRAY)
+        const [removingCountPlusOne, remBytes] = readUnsignedVarint(value, valueOffset);
         valueOffset += remBytes;
+        const removingCount = removingCountPlusOne - 1;
         for (let i = 0; i < removingCount && valueOffset < value.length; i++) {
           const [, skipBytes] = readVarint(value, valueOffset);
           valueOffset += skipBytes;
         }
         
-        // addingReplicas array
+        // addingReplicas array (COMPACT_ARRAY)
         if (valueOffset < value.length) {
-          const [addingCount, addBytes] = readVarint(value, valueOffset);
+          const [addingCountPlusOne, addBytes] = readUnsignedVarint(value, valueOffset);
           valueOffset += addBytes;
+          const addingCount = addingCountPlusOne - 1;
           for (let i = 0; i < addingCount && valueOffset < value.length; i++) {
             const [, skipBytes] = readVarint(value, valueOffset);
             valueOffset += skipBytes;
           }
         }
         
-        // leader (int32 as varint)
+        // leader (signed varint)
         if (valueOffset < value.length) {
           const [leaderVal, lBytes] = readVarint(value, valueOffset);
           leader = leaderVal;
@@ -539,7 +548,7 @@ function parsePartitionRecord(key, value) {
       leaderEpoch: 0
     });
   } catch (err) {
-    console.log("    Error parsing PartitionRecord:", err.message, err.stack);
+    console.log("    Error parsing PartitionRecord:", err.message);
   }
 }
 
