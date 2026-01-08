@@ -2548,6 +2548,243 @@ created flows  parts  throughput    complete
 
 ---
 
+## 🔄 Replication & High Availability
+
+**Status:** IMPLEMENTED
+
+**What it does:**
+- Leader-follower replication for fault tolerance
+- In-Sync Replicas (ISR) tracking for consistency
+- Leader election on broker failure
+- Configurable replication factor per topic
+- Leader validation before writes
+- Multi-broker support
+- Data redundancy across brokers
+
+**Purpose:**
+Provides high availability and fault tolerance by replicating data across multiple brokers. If a broker fails, another replica can take over as leader without data loss.
+
+**Replication Architecture:**
+```
+Topic: orders, Partitions: 2, Replication Factor: 3
+
+Partition 0:
+├─ Broker 1 (Leader) ← Handles reads/writes
+├─ Broker 2 (Follower) ← Replicates data
+└─ Broker 3 (Follower) ← Replicates data
+
+Partition 1:
+├─ Broker 2 (Leader) ← Handles reads/writes
+├─ Broker 3 (Follower) ← Replicates data  
+└─ Broker 1 (Follower) ← Replicates data
+```
+
+**ISR (In-Sync Replicas):**
+```
+ISR = Replicas that are:
+  1. Alive (responding to heartbeats)
+  2. Caught up (minimal lag)
+  3. Ready to become leader
+
+Example:
+Partition orders-0:
+  Replicas: [1, 2, 3]
+  ISR: [1, 2, 3]  ✓ All in-sync
+  Leader: 1
+
+If Broker 3 lags:
+  Replicas: [1, 2, 3]
+  ISR: [1, 2]  ⚠️ Broker 3 removed
+  Leader: 1
+```
+
+**Leader Election:**
+```
+Scenario: Leader broker fails
+
+Before:
+  Leader: Broker 1 ✗ (Failed)
+  ISR: [1, 2, 3]
+
+After Election:
+  Leader: Broker 2 ✓ (New leader from ISR)
+  ISR: [2, 3]
+  
+Producer → Automatically routes to new leader
+Consumer → Reads from new leader
+Zero downtime!
+```
+
+**Configuration:**
+```bash
+# Environment variables
+BROKER_ID=1              # Unique broker identifier
+REPLICATION_FACTOR=3     # Number of replicas per partition
+```
+
+**Implementation:**
+```javascript
+// Replication state tracking
+const replicationState = new Map(); // partitionKey -> state
+
+Partition State:
+{
+  leader: 1,              // Current leader broker ID
+  replicas: [1, 2, 3],    // All replica brokers
+  isr: [1, 2, 3],         // In-sync replicas
+  followers: [2, 3],      // Non-leader replicas
+  lastUpdated: timestamp
+}
+
+// Initialize replication for new partition
+function initializeReplication(topic, partition, replicationFactor) {
+  // Assign replicas (round-robin across brokers)
+  const replicas = assignReplicas(replicationFactor);
+  
+  // First replica is leader
+  const leader = replicas[0];
+  
+  // All start in-sync
+  const isr = [...replicas];
+  
+  return { leader, replicas, isr };
+}
+
+// Check leadership before writes
+function handleProduce(...) {
+  const replicationInfo = getReplicationInfo(topic, partition);
+  
+  if (!replicationInfo.isLeader) {
+    return error(6); // NOT_LEADER_FOR_PARTITION
+  }
+  
+  // Proceed with write...
+}
+
+// Elect new leader on failure
+function electLeader(topic, partition) {
+  const state = replicationState.get(partitionKey);
+  
+  // Choose first replica in ISR
+  const newLeader = state.isr[0];
+  
+  state.leader = newLeader;
+  state.followers = replicas.filter(r => r !== newLeader);
+  
+  return newLeader;
+}
+```
+
+**Leader Validation:**
+```
+Producer → PRODUCE(partition=0)
+     ↓
+Broker checks: Am I the leader?
+     ├─ YES → Accept write
+     └─ NO  → Return NOT_LEADER_FOR_PARTITION (error 6)
+             → Client retries with correct leader
+```
+
+**Data Flow with Replication:**
+```
+1. Producer sends message to Leader
+     ↓
+2. Leader writes to local log
+     ↓
+3. Leader sends to Followers
+     ↓
+4. Followers write to their logs
+     ↓
+5. Followers acknowledge to Leader
+     ↓
+6. Leader updates ISR
+     ↓
+7. Leader acknowledges to Producer
+     ↓
+8. Message is committed (visible to consumers)
+```
+
+**Fault Tolerance Levels:**
+```
+Replication Factor 1:
+├─ 0 failures tolerated
+├─ No redundancy
+└─ Data loss on broker failure
+
+Replication Factor 2:
+├─ 1 failure tolerated
+├─ 1 copy redundant
+└─ Can survive 1 broker failure
+
+Replication Factor 3:
+├─ 2 failures tolerated
+├─ 2 copies redundant
+└─ Can survive 2 broker failures (recommended)
+```
+
+**Benefits:**
+- ✅ **High Availability**: Service continues if brokers fail
+- ✅ **Fault Tolerance**: No data loss with proper replication
+- ✅ **Load Distribution**: Partitions distributed across brokers
+- ✅ **Automatic Failover**: Leader election without manual intervention
+- ✅ **Data Durability**: Multiple copies of data
+- ✅ **Read Scalability**: Followers can serve read requests
+
+**Performance Impact:**
+```
+Replication Factor 1: 100% throughput, 0% redundancy
+Replication Factor 2: ~70% throughput, 1x redundancy
+Replication Factor 3: ~50% throughput, 2x redundancy
+```
+
+**ISR Management:**
+```javascript
+// Update ISR when replica falls behind
+function updateISR(topic, partition, replicaId, inSync) {
+  const state = replicationState.get(partitionKey);
+  
+  if (inSync && !state.isr.includes(replicaId)) {
+    state.isr.push(replicaId);  // Add to ISR
+  } else if (!inSync && state.isr.includes(replicaId)) {
+    state.isr = state.isr.filter(r => r !== replicaId);  // Remove from ISR
+  }
+}
+```
+
+**Real-World Scenario:**
+```
+E-commerce Platform:
+├─ 3 Kafka brokers
+├─ orders topic: 10 partitions, RF=3
+├─ Each partition replicated 3x
+└─ Total: 30 partition replicas
+
+Broker 1 fails:
+├─ 10 partitions affected
+├─ New leaders elected from ISR
+├─ Traffic redistributed
+├─ Zero downtime
+└─ Zero data loss
+```
+
+**Key Features:**
+- ✅ Configurable replication factor
+- ✅ Leader election algorithm
+- ✅ ISR tracking and management
+- ✅ Leader validation on writes
+- ✅ Replica assignment strategy
+- ✅ Failover automation
+- ✅ Multi-broker coordination
+
+**Production Considerations:**
+- **min.insync.replicas**: Minimum ISR size for writes (usually RF-1)
+- **unclean.leader.election**: Allow non-ISR leader election (data loss risk)
+- **rack.awareness**: Place replicas in different racks/AZs
+- **monitoring**: Track ISR shrinks, leader elections
+- **capacity**: Plan for (partitions × RF) total replica count
+
+---
+
 ## 🔮 Future Enhancement Ideas
 
 ### Stage 18: Multiple Record Batches
@@ -2850,7 +3087,8 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Status:** Core Implementation Complete + Full Topic Management + Transactions  
-**Total Lines of Code:** ~2,600 lines  
-**APIs Implemented:** 8 (Produce, Fetch, ApiVersions, CreateTopics, DeleteTopics, CreatePartitions, EndTxn, DescribeTopicPartitions)
+**Status:** Core Implementation Complete + Full Topic Management + Transactions + Replication  
+**Total Lines of Code:** ~2,750 lines  
+**APIs Implemented:** 8 (Produce, Fetch, ApiVersions, CreateTopics, DeleteTopics, CreatePartitions, EndTxn, DescribeTopicPartitions)  
+**Enterprise Features:** Exactly-Once Semantics, Leader-Follower Replication, High Availability
 
