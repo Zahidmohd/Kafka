@@ -1147,6 +1147,232 @@ function buildFetchResponseBody(requestedTopics) {
   return responseBody;
 }
 
+// Handler for Produce API (API key 0)
+function handleProduce(connection, requestApiVersion, correlationId, data) {
+  console.log("Handling Produce request");
+  
+  // Parse Produce v11 request
+  // Request Header v2:
+  // - message_size (4 bytes)
+  // - request_api_key (2 bytes)
+  // - request_api_version (2 bytes)
+  // - correlation_id (4 bytes)
+  // - client_id (NULLABLE_STRING: INT16 length + bytes)
+  // - TAG_BUFFER (1 byte)
+  
+  let offset = 12; // Skip message_size, api_key, api_version, correlation_id
+  
+  // Parse client_id (NULLABLE_STRING)
+  const clientIdLength = data.readInt16BE(offset);
+  offset += 2;
+  if (clientIdLength > 0) {
+    offset += clientIdLength; // Skip client_id bytes
+  }
+  
+  // TAG_BUFFER (header)
+  offset += 1;
+  
+  // Now parse Produce v11 request body
+  // transactional_id (COMPACT_NULLABLE_STRING)
+  const transactionalIdLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  if (transactionalIdLength >= 0) {
+    offset += transactionalIdLength;
+  }
+  
+  // acks (INT16)
+  offset += 2;
+  
+  // timeout_ms (INT32)
+  offset += 4;
+  
+  // topics (COMPACT_ARRAY)
+  const topicsArrayLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  
+  console.log(`Number of topics in Produce request: ${topicsArrayLength}`);
+  
+  // Parse all topics and their partitions
+  const requestTopics = [];
+  
+  for (let i = 0; i < topicsArrayLength; i++) {
+    // topic name (COMPACT_STRING)
+    const topicNameLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    const topicName = data.toString('utf8', offset, offset + topicNameLength);
+    offset += topicNameLength;
+    
+    console.log(`Topic ${i}: ${topicName}`);
+    
+    // partitions (COMPACT_ARRAY)
+    const partitionsArrayLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    
+    const partitions = [];
+    
+    for (let j = 0; j < partitionsArrayLength; j++) {
+      // partition index (INT32)
+      const partitionIndex = data.readInt32BE(offset);
+      offset += 4;
+      
+      console.log(`  Partition ${j}: index=${partitionIndex}`);
+      
+      // records (COMPACT_RECORDS / COMPACT_BYTES)
+      // Read the length as unsigned varint
+      let recordsLength = 0;
+      let shift = 0;
+      let byte;
+      do {
+        byte = data.readUInt8(offset);
+        offset += 1;
+        recordsLength |= (byte & 0x7F) << shift;
+        shift += 7;
+      } while (byte & 0x80);
+      
+      recordsLength -= 1; // Compact encoding: subtract 1
+      
+      console.log(`  Records length: ${recordsLength}`);
+      
+      // Skip the records data
+      if (recordsLength > 0) {
+        offset += recordsLength;
+      }
+      
+      // TAG_BUFFER (partition)
+      offset += 1;
+      
+      partitions.push({
+        index: partitionIndex
+      });
+    }
+    
+    // TAG_BUFFER (topic)
+    offset += 1;
+    
+    requestTopics.push({
+      name: topicName,
+      partitions: partitions
+    });
+  }
+  
+  // Build Produce v11 response
+  // For this stage, return error code 3 (UNKNOWN_TOPIC_OR_PARTITION) for all topics/partitions
+  
+  // Calculate response body size
+  let bodySize = 0;
+  
+  // responses (COMPACT_ARRAY): length
+  bodySize += 1;
+  
+  for (const topic of requestTopics) {
+    // topic name (COMPACT_STRING): length + name bytes
+    bodySize += 1 + topic.name.length;
+    
+    // partitions (COMPACT_ARRAY): length
+    bodySize += 1;
+    
+    for (const partition of topic.partitions) {
+      // partition response fields
+      bodySize += 4;  // index (INT32)
+      bodySize += 2;  // error_code (INT16)
+      bodySize += 8;  // base_offset (INT64)
+      bodySize += 8;  // log_append_time_ms (INT64)
+      bodySize += 8;  // log_start_offset (INT64)
+      bodySize += 1;  // record_errors (COMPACT_ARRAY, empty = 1)
+      bodySize += 1;  // error_message (COMPACT_NULLABLE_STRING, null = 0)
+      bodySize += 1;  // TAG_BUFFER
+    }
+    
+    bodySize += 1; // TAG_BUFFER (topic)
+  }
+  
+  bodySize += 4; // throttle_time_ms (INT32)
+  bodySize += 1; // TAG_BUFFER (final)
+  
+  // Response Header v1: correlation_id + TAG_BUFFER
+  const headerSize = 4 + 1;
+  
+  // Build response
+  const response = Buffer.alloc(4 + headerSize + bodySize);
+  let responseOffset = 0;
+  
+  // message_size
+  response.writeInt32BE(headerSize + bodySize, responseOffset);
+  responseOffset += 4;
+  
+  // Response Header v1
+  response.writeInt32BE(correlationId, responseOffset);
+  responseOffset += 4;
+  response.writeUInt8(0, responseOffset); // TAG_BUFFER
+  responseOffset += 1;
+  
+  // Response Body
+  // responses (COMPACT_ARRAY)
+  response.writeUInt8(requestTopics.length + 1, responseOffset);
+  responseOffset += 1;
+  
+  for (const topic of requestTopics) {
+    // topic name (COMPACT_STRING)
+    response.writeUInt8(topic.name.length + 1, responseOffset);
+    responseOffset += 1;
+    response.write(topic.name, responseOffset, 'utf8');
+    responseOffset += topic.name.length;
+    
+    // partitions (COMPACT_ARRAY)
+    response.writeUInt8(topic.partitions.length + 1, responseOffset);
+    responseOffset += 1;
+    
+    for (const partition of topic.partitions) {
+      // index (INT32)
+      response.writeInt32BE(partition.index, responseOffset);
+      responseOffset += 4;
+      
+      // error_code (INT16): 3 = UNKNOWN_TOPIC_OR_PARTITION
+      response.writeInt16BE(3, responseOffset);
+      responseOffset += 2;
+      
+      // base_offset (INT64): -1
+      response.writeBigInt64BE(-1n, responseOffset);
+      responseOffset += 8;
+      
+      // log_append_time_ms (INT64): -1
+      response.writeBigInt64BE(-1n, responseOffset);
+      responseOffset += 8;
+      
+      // log_start_offset (INT64): -1
+      response.writeBigInt64BE(-1n, responseOffset);
+      responseOffset += 8;
+      
+      // record_errors (COMPACT_ARRAY): empty
+      response.writeUInt8(1, responseOffset); // 0 elements + 1
+      responseOffset += 1;
+      
+      // error_message (COMPACT_NULLABLE_STRING): null
+      response.writeUInt8(0, responseOffset);
+      responseOffset += 1;
+      
+      // TAG_BUFFER (partition)
+      response.writeUInt8(0, responseOffset);
+      responseOffset += 1;
+    }
+    
+    // TAG_BUFFER (topic)
+    response.writeUInt8(0, responseOffset);
+    responseOffset += 1;
+  }
+  
+  // throttle_time_ms (INT32): 0
+  response.writeInt32BE(0, responseOffset);
+  responseOffset += 4;
+  
+  // TAG_BUFFER (final)
+  response.writeUInt8(0, responseOffset);
+  responseOffset += 1;
+  
+  console.log("Sending Produce response:", response.toString('hex'));
+  connection.write(response);
+}
+
 // Handler for ApiVersions API (API key 18)
 function handleApiVersions(connection, requestApiVersion, correlationId) {
   console.log("Handling ApiVersions request");
@@ -1377,15 +1603,18 @@ const server = net.createServer((connection) => {
     console.log("Correlation ID:", correlationId);
     
     // Route to appropriate API handler
-    if (requestApiKey === 18) {
+    if (requestApiKey === 0) {
+      // Produce API
+      handleProduce(connection, requestApiVersion, correlationId, data);
+    } else if (requestApiKey === 1) {
+      // Fetch API
+      handleFetch(connection, requestApiVersion, correlationId, data);
+    } else if (requestApiKey === 18) {
       // ApiVersions API
       handleApiVersions(connection, requestApiVersion, correlationId);
     } else if (requestApiKey === 75) {
       // DescribeTopicPartitions API
       handleDescribeTopicPartitions(connection, data, correlationId);
-    } else if (requestApiKey === 1) {
-      // Fetch API
-      handleFetch(connection, requestApiVersion, correlationId, data);
     } else {
       console.log("Unknown API key:", requestApiKey);
     }

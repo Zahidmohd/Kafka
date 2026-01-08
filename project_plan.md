@@ -1135,30 +1135,262 @@ records.copy(responseBody, offset);
 
 ---
 
+### ✅ Stage 14: Advertise Produce API
+
+**Status:** COMPLETED
+
+**What it does:**
+- Adds Produce API (API key 0) to ApiVersions response
+- Advertises support for Produce v0-v11
+- Allows clients to discover that the broker supports message production
+
+**Purpose:**
+This stage expands the broker's advertised capabilities to include the Produce API, which is essential for clients that want to write messages to Kafka topics. This is the first step toward implementing full producer support.
+
+**ApiVersions Response Update:**
+```javascript
+// Now supports 4 APIs (was 3):
+// - Produce (0): min=0, max=11
+// - Fetch (1): min=0, max=16
+// - ApiVersions (18): min=0, max=4
+// - DescribeTopicPartitions (75): min=0, max=0
+
+// Body size increased from 29 to 36 bytes
+const responseBody = Buffer.alloc(36);
+
+// Array length updated from 4 to 5 (compact encoding for 4 APIs)
+responseBody.writeUInt8(5, offset);
+
+// New API entry for Produce
+responseBody.writeInt16BE(0, offset);  // api_key: Produce
+responseBody.writeInt16BE(0, offset + 2);  // min_version: 0
+responseBody.writeInt16BE(11, offset + 4);  // max_version: 11
+responseBody.writeUInt8(0, offset + 6);  // TAG_BUFFER
+```
+
+**API Versions Supported:**
+| API Key | API Name | Min Version | Max Version | Purpose |
+|---------|----------|-------------|-------------|---------|
+| 0 | Produce | 0 | 11 | Write messages to topics |
+| 1 | Fetch | 0 | 16 | Read messages from topics |
+| 18 | ApiVersions | 0 | 4 | Discover supported APIs |
+| 75 | DescribeTopicPartitions | 0 | 0 | Get topic metadata |
+
+**Response Structure:**
+```
+Message Size: 40 bytes (was 33)
+├─ message_size (4 bytes): 40
+├─ correlation_id (4 bytes): <from request>
+└─ body (36 bytes):
+   ├─ error_code (2): 0
+   ├─ api_keys array length (1): 5 (= 4 APIs + 1)
+   ├─ Produce entry (7 bytes)
+   ├─ Fetch entry (7 bytes)
+   ├─ ApiVersions entry (7 bytes)
+   ├─ DescribeTopicPartitions entry (7 bytes)
+   ├─ throttle_time_ms (4): 0
+   └─ TAG_BUFFER (1): 0
+```
+
+**What's Next:**
+The broker now advertises Produce API support. Future stages will implement:
+- Parsing Produce requests
+- Writing messages to partition logs
+- Generating acknowledgments
+- Handling idempotent producers
+- Transaction support
+
+---
+
+### ✅ Stage 15: Produce Response for Invalid Topics/Partitions
+
+**Status:** COMPLETED
+
+**What it does:**
+- Parses Produce v11 requests to extract topic names and partition indices
+- Returns error code 3 (UNKNOWN_TOPIC_OR_PARTITION) for all requests
+- Implements complete Produce v11 response structure
+- For this stage, hardcodes error responses (assumes all topics/partitions are invalid)
+
+**Purpose:**
+This stage implements the foundation for producer support by parsing Produce requests and building proper error responses. This is essential for validating the request/response flow before implementing actual message writing.
+
+**Produce v11 Request Structure:**
+```
+Request Header v2:
+├─ message_size (4)
+├─ request_api_key (2): 0
+├─ request_api_version (2): 11
+├─ correlation_id (4)
+├─ client_id (NULLABLE_STRING)
+└─ TAG_BUFFER (1)
+
+Request Body:
+├─ transactional_id (COMPACT_NULLABLE_STRING)
+├─ acks (INT16)
+├─ timeout_ms (INT32)
+├─ topics (COMPACT_ARRAY)
+│  ├─ name (COMPACT_STRING)
+│  ├─ partitions (COMPACT_ARRAY)
+│  │  ├─ index (INT32)
+│  │  ├─ records (COMPACT_BYTES / varint length + data)
+│  │  └─ TAG_BUFFER
+│  └─ TAG_BUFFER
+└─ TAG_BUFFER
+```
+
+**Produce v11 Response Structure (Error):**
+```
+Response Header v1:
+├─ correlation_id (4)
+└─ TAG_BUFFER (1)
+
+Response Body:
+├─ responses (COMPACT_ARRAY)
+│  ├─ name (COMPACT_STRING): echoed from request
+│  ├─ partitions (COMPACT_ARRAY)
+│  │  ├─ index (INT32): echoed from request
+│  │  ├─ error_code (INT16): 3 (UNKNOWN_TOPIC_OR_PARTITION)
+│  │  ├─ base_offset (INT64): -1
+│  │  ├─ log_append_time_ms (INT64): -1
+│  │  ├─ log_start_offset (INT64): -1
+│  │  ├─ record_errors (COMPACT_ARRAY): empty
+│  │  ├─ error_message (COMPACT_NULLABLE_STRING): null
+│  │  └─ TAG_BUFFER
+│  └─ TAG_BUFFER
+├─ throttle_time_ms (INT32): 0
+└─ TAG_BUFFER
+```
+
+**Parsing COMPACT_BYTES (Records):**
+```javascript
+// Records use unsigned varint for length
+let recordsLength = 0;
+let shift = 0;
+let byte;
+do {
+  byte = data.readUInt8(offset);
+  offset += 1;
+  recordsLength |= (byte & 0x7F) << shift;
+  shift += 7;
+} while (byte & 0x80);
+
+recordsLength -= 1; // Compact encoding: subtract 1
+
+// Skip records data
+if (recordsLength > 0) {
+  offset += recordsLength;
+}
+```
+
+**Building Error Response:**
+```javascript
+// For each partition in each topic
+response.writeInt32BE(partition.index, offset);  // index
+offset += 4;
+
+response.writeInt16BE(3, offset);  // error_code: UNKNOWN_TOPIC_OR_PARTITION
+offset += 2;
+
+response.writeBigInt64BE(-1n, offset);  // base_offset: -1
+offset += 8;
+
+response.writeBigInt64BE(-1n, offset);  // log_append_time_ms: -1
+offset += 8;
+
+response.writeBigInt64BE(-1n, offset);  // log_start_offset: -1
+offset += 8;
+
+response.writeUInt8(1, offset);  // record_errors: empty array
+offset += 1;
+
+response.writeUInt8(0, offset);  // error_message: null
+offset += 1;
+
+response.writeUInt8(0, offset);  // TAG_BUFFER
+offset += 1;
+```
+
+**Key Concepts:**
+- **COMPACT_BYTES with Varint**: Records field uses unsigned varint encoding for length
+- **INT64 Fields**: Base offset, timestamps use 8-byte signed integers
+- **BigInt Support**: JavaScript BigInt (`-1n`) for 64-bit values
+- **Error Code 3**: UNKNOWN_TOPIC_OR_PARTITION for both invalid topics and invalid partitions
+- **Null Values**: -1 for numeric fields, 0 for null strings in error responses
+- **Echo Pattern**: Topic name and partition index are echoed back from request
+
+**Implementation Highlights:**
+```javascript
+function handleProduce(connection, requestApiVersion, correlationId, data) {
+  // Parse request header + body
+  // Extract topics and partitions
+  const requestTopics = [];
+  
+  for (let i = 0; i < topicsArrayLength; i++) {
+    const topicName = parseCompactString(data, offset);
+    const partitions = [];
+    
+    for (let j = 0; j < partitionsArrayLength; j++) {
+      const partitionIndex = data.readInt32BE(offset);
+      // Skip records (varint length + data)
+      partitions.push({ index: partitionIndex });
+    }
+    
+    requestTopics.push({ name: topicName, partitions });
+  }
+  
+  // Build error response
+  for (const topic of requestTopics) {
+    for (const partition of topic.partitions) {
+      // Write error code 3 with -1 values
+    }
+  }
+}
+```
+
+**Producer Error Flow:**
+1. Producer sends Produce request
+2. Broker parses topic name and partition
+3. Broker validates topic/partition existence (returns error for now)
+4. Broker returns error response with code 3
+5. Producer receives error and can retry or handle
+
+**What's Next:**
+Stage 16 will implement validation logic to check if topics/partitions actually exist, and return success responses for valid requests.
+
+---
+
 ## 🔮 Future Stages (To Be Implemented)
 
-### Stage 14: Advanced Fetch Features
+### Stage 16: Produce Success Response
+- Validate topics and partitions exist
+- Return success responses (error_code 0) for valid topics
+- Still no actual writing to disk yet
+- Implement proper offset tracking
+
+### Stage 16: Writing Messages to Disk
+- Write record batches to partition log files
+- Update log file offsets
+- Maintain log integrity
+- Handle file rotation
+
+### Stage 17: Advanced Fetch Features
 - Handle fetch offsets (start reading from specific position)
 - Support max bytes limit
 - Handle multiple partitions
 - Optimize large message handling
 
-### Stage 15: Topic Management  
+### Stage 18: Topic Management  
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 16: Produce API
-- Accept messages from producers
-- Write events to partitions
-- Acknowledge successful writes
-
-### Stage 17: Message Storage
-- Persist messages to disk
-- Implement log segments
+### Stage 19: Message Compaction
 - Support for log compaction
+- Implement cleanup policies
+- Optimize storage
 
-### Stage 18: Replication (Advanced)
+### Stage 20: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication
@@ -1427,6 +1659,6 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 14 - Produce API Advertised Complete  
-**Total Lines of Code:** ~1,395 lines
+**Current Stage:** Stage 15 - Produce Invalid Topics/Partitions Complete  
+**Total Lines of Code:** ~1,640 lines
 
