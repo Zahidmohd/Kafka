@@ -1427,6 +1427,6 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 13 - Fetch with Actual Messages Complete  
-**Total Lines of Code:** ~1,300 lines
+**Current Stage:** Stage 14 - Produce API Advertised Complete  
+**Total Lines of Code:** ~1,395 lines
 
