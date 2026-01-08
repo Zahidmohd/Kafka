@@ -5,71 +5,122 @@ import path from "path";
 // You can use print statements as follows for debugging, they'll be visible when running tests.
 console.log("Logs from your program will appear here!");
 
-// Store topic metadata in memory
+// Store topic metadata in memory (cache)
 const topicsMetadata = new Map();
 
-// Parse cluster metadata log file to extract topic information
-function parseClusterMetadata() {
+// Simple and reliable approach: search for topic name in log file
+function findTopicInLog(topicName) {
   const logPath = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log";
   
   try {
     if (!fs.existsSync(logPath)) {
       console.log("Cluster metadata log file not found:", logPath);
-      return;
+      return null;
     }
     
     const logData = fs.readFileSync(logPath);
-    console.log("Reading cluster metadata log, size:", logData.length, "bytes");
+    console.log(`Searching for topic "${topicName}" in log file (${logData.length} bytes)`);
     
-    // Parse Kafka log format
-    // Kafka log format consists of records with specific structure
-    // We need to find topic records and partition records
+    // Convert topic name to buffer for searching
+    const topicNameBuffer = Buffer.from(topicName, 'utf-8');
+    const topicNameIndex = logData.indexOf(topicNameBuffer);
     
-    let offset = 0;
-    let recordCount = 0;
+    if (topicNameIndex === -1) {
+      console.log(`Topic "${topicName}" not found in log file`);
+      return null;
+    }
     
-    while (offset < logData.length - 12) {
-      try {
-        // Kafka log record format (simplified):
-        // - baseOffset (8 bytes)
-        // - length (4 bytes)
-        // - record batch data
-        
-        const baseOffset = logData.readBigInt64BE(offset);
-        offset += 8;
-        
-        const batchLength = logData.readInt32BE(offset);
-        offset += 4;
-        
-        if (batchLength < 0 || batchLength > logData.length - offset) {
-          console.log("Invalid batch length, stopping");
-          break;
-        }
-        
-        // Parse the record batch
-        const batchData = logData.slice(offset, offset + batchLength);
-        parseRecordBatch(batchData);
-        
-        offset += batchLength;
-        recordCount++;
-        
-        if (recordCount > 200) {
-          console.log("Stopping after 200 records to avoid infinite loop");
-          break;
-        }
-      } catch (err) {
-        console.log("Error parsing record entry:", err.message);
-        break;
+    console.log(`✓ Found topic "${topicName}" at index:`, topicNameIndex);
+    
+    // Extract topic UUID (16 bytes immediately after the topic name)
+    const topicUUID = Buffer.alloc(16);
+    logData.copy(topicUUID, 0, topicNameIndex + topicNameBuffer.length, topicNameIndex + topicNameBuffer.length + 16);
+    
+    console.log('✓ Topic UUID:', topicUUID.toString('hex'));
+    
+    // Search for partition data by finding the UUID again in the remaining log
+    const searchStart = topicNameIndex + topicNameBuffer.length + 16;
+    const remainingLogFile = logData.subarray(searchStart);
+    const partitionIndex = remainingLogFile.indexOf(topicUUID);
+    
+    if (partitionIndex === -1) {
+      console.log('No partition data found for topic');
+      return {
+        name: topicName,
+        id: topicUUID,
+        partitions: []
+      };
+    }
+    
+    console.log('✓ Found partition data at offset:', partitionIndex);
+    
+    // Parse partition data
+    const partitions = [];
+    let offset = partitionIndex;
+    
+    // Partition index is 4 bytes before the UUID
+    const partitionId = remainingLogFile.readInt32BE(offset - 4);
+    offset += 16; // Skip UUID
+    
+    // Helper: read compact array (length + 1 encoding)
+    function readCompactArray(buffer, pos) {
+      const arrayLength = buffer.readInt8(pos) - 1;
+      pos += 1;
+      const values = [];
+      for (let i = 0; i < arrayLength; i++) {
+        values.push(buffer.readInt32BE(pos));
+        pos += 4;
       }
+      return { values, nextOffset: pos };
     }
     
-    console.log("===== PARSING COMPLETE =====");
-    console.log("Topics found:", Array.from(topicsMetadata.keys()));
-    for (const [name, metadata] of topicsMetadata.entries()) {
-      console.log(`  ${name}: UUID=${metadata.id?.toString('hex')}, partitions=${metadata.partitions.length}`);
-    }
+    // Read replica nodes (compact array of 4-byte broker IDs)
+    const replicaNodes = readCompactArray(remainingLogFile, offset);
+    offset = replicaNodes.nextOffset;
+    
+    // Read ISR nodes (compact array of 4-byte broker IDs)
+    const isrNodes = readCompactArray(remainingLogFile, offset);
+    offset = isrNodes.nextOffset;
+    
+    // Read removing replicas (compact array of 4-byte broker IDs)
+    const removingReplicas = readCompactArray(remainingLogFile, offset);
+    offset = removingReplicas.nextOffset;
+    
+    // Read adding replicas (compact array of 4-byte broker IDs)
+    const addingReplicas = readCompactArray(remainingLogFile, offset);
+    offset = addingReplicas.nextOffset;
+    
+    // Leader ID (4 bytes)
+    const leaderId = remainingLogFile.readInt32BE(offset);
+    offset += 4;
+    
+    // Leader epoch (4 bytes)
+    const leaderEpoch = remainingLogFile.readInt32BE(offset);
+    offset += 4;
+    
+    partitions.push({
+      partitionId: partitionId,
+      leader: leaderId,
+      replicas: replicaNodes.values,
+      isr: isrNodes.values,
+      leaderEpoch: leaderEpoch
+    });
+    
+    console.log(`✓ Partition ${partitionId}: leader=${leaderId}, replicas=[${replicaNodes.values}], isr=[${isrNodes.values}]`);
+    
+    const metadata = {
+      name: topicName,
+      id: topicUUID,
+      partitions: partitions
+    };
+    
+    // Cache it
+    topicsMetadata.set(topicName, metadata);
+    
+    return metadata;
   } catch (err) {
-    console.log("Error reading cluster metadata:", err.message);
+    console.log("Error finding topic in log:", err.message);
+    return null;
   }
 }
 
@@ -688,9 +739,15 @@ function handleDescribeTopicPartitions(connection, data, correlationId) {
   // Build DescribeTopicPartitions v0 response
   // Response uses header v1: correlation_id + TAG_BUFFER
   
-  // Check if topic exists in metadata
-  const topicMetadata = topicsMetadata.get(topicName);
-  const topicExists = topicMetadata !== undefined;
+  // Check if topic exists (check cache first, then search log file)
+  let topicMetadata = topicsMetadata.get(topicName);
+  
+  if (!topicMetadata) {
+    // Not in cache, search the log file
+    topicMetadata = findTopicInLog(topicName);
+  }
+  
+  const topicExists = topicMetadata !== undefined && topicMetadata !== null;
   
   console.log("Topic exists:", topicExists);
   if (topicExists) {
@@ -719,9 +776,6 @@ function handleDescribeTopicPartitions(connection, data, correlationId) {
   console.log("Sending DescribeTopicPartitions response:", response.toString('hex'));
   connection.write(response);
 }
-
-// Parse cluster metadata on startup
-parseClusterMetadata();
 
 const server = net.createServer((connection) => {
   console.log("Client connected");
