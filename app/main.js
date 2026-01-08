@@ -31,7 +31,7 @@ function readPartitionLog(topicName, partitionId) {
     
     // Kafka log format:
     // Each entry: baseOffset (8 bytes) + batchLength (4 bytes) + batchData
-    // We'll read all record batches and return them
+    // For Fetch response, we need to include baseOffset + batchLength + batchData
     const recordBatches = [];
     let offset = 0;
     
@@ -40,6 +40,7 @@ function readPartitionLog(topicName, partitionId) {
         break; // Not enough data for header
       }
       
+      const entryStart = offset;
       const baseOffset = logData.readBigInt64BE(offset);
       offset += 8;
       
@@ -51,11 +52,12 @@ function readPartitionLog(topicName, partitionId) {
         break;
       }
       
-      // Read the entire record batch (without the baseOffset and batchLength prefix)
-      const batchData = logData.slice(offset, offset + batchLength);
-      recordBatches.push(batchData);
+      // Read the entire entry INCLUDING baseOffset and batchLength
+      const entryLength = 8 + 4 + batchLength;
+      const entryData = logData.slice(entryStart, entryStart + entryLength);
+      recordBatches.push(entryData);
       
-      console.log(`  Record batch: baseOffset=${baseOffset}, length=${batchLength}`);
+      console.log(`  Record batch: baseOffset=${baseOffset}, batchLength=${batchLength}, totalEntryLength=${entryLength}`);
       
       offset += batchLength;
     }
@@ -65,7 +67,7 @@ function readPartitionLog(topicName, partitionId) {
       return null;
     }
     
-    // Concatenate all record batches
+    // Concatenate all record batches (with their headers)
     const allBatches = Buffer.concat(recordBatches);
     console.log(`Total record batches: ${recordBatches.length}, total size: ${allBatches.length} bytes`);
     

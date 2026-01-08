@@ -996,30 +996,169 @@ responseBody.writeInt16BE(errorCode, offset);
 
 ---
 
+### ✅ Stage 13: Fetch with Actual Messages
+
+**Status:** COMPLETED
+
+**What it does:**
+- Reads messages from partition log files on disk
+- Returns actual Kafka record batches in Fetch response
+- Properly encodes record data as COMPACT_BYTES
+- Handles varint encoding for variable-length data
+
+**Purpose:**
+Enables consumers to actually read messages from Kafka topics, completing the basic message consumption flow.
+
+**Partition Log File Structure:**
+```
+/tmp/kraft-combined-logs/<topic-name>-<partition>/00000000000000000000.log
+
+File format:
+├─ Record Entry 1:
+│  ├─ baseOffset (8 bytes, INT64)
+│  ├─ batchLength (4 bytes, INT32)
+│  └─ Record Batch Data (batchLength bytes)
+├─ Record Entry 2...
+└─ Record Entry N...
+```
+
+**Reading Partition Logs:**
+```javascript
+function readPartitionLog(topicName, partitionId) {
+  const logFile = `/tmp/kraft-combined-logs/${topicName}-${partitionId}/00000000000000000000.log`;
+  const logData = fs.readFileSync(logFile);
+  
+  const recordBatches = [];
+  let offset = 0;
+  
+  while (offset < logData.length) {
+    const baseOffset = logData.readBigInt64BE(offset);
+    offset += 8;
+    
+    const batchLength = logData.readInt32BE(offset);
+    offset += 4;
+    
+    // Read the entire record batch
+    const batchData = logData.slice(offset, offset + batchLength);
+    recordBatches.push(batchData);
+    offset += batchLength;
+  }
+  
+  // Concatenate all batches
+  return Buffer.concat(recordBatches);
+}
+```
+
+**Fetch Response with Records:**
+```
+partition_index: 0
+error_code: 0 (NO_ERROR)
+high_watermark: 0
+last_stable_offset: 0
+log_start_offset: 0
+aborted_transactions: []
+preferred_read_replica: -1
+records: <COMPACT_BYTES>
+  ├─ varint length (recordsLength + 1)
+  └─ record batch data (raw bytes from log file)
+TAG_BUFFER: empty
+```
+
+**COMPACT_BYTES Encoding:**
+```javascript
+// For data with length N:
+// Write unsigned varint (N + 1)
+let len = recordsLength + 1;
+while (len >= 128) {
+  responseBody.writeUInt8((len & 0x7F) | 0x80, offset);
+  len >>>= 7;
+}
+responseBody.writeUInt8(len & 0x7F, offset);
+
+// Write actual data
+recordBatchData.copy(responseBody, offset);
+```
+
+**Varint Encoding:**
+- **1 byte**: values 0-127
+- **2 bytes**: values 128-16,383
+- **3 bytes**: values 16,384-2,097,151
+- **4 bytes**: values 2,097,152-268,435,455
+- **5 bytes**: larger values
+
+Each byte uses 7 bits for data, 1 bit (MSB) to indicate continuation.
+
+**Record Batch Format (from Kafka):**
+The record batch data read from disk contains:
+- Partition leader epoch
+- Magic byte (version indicator)
+- CRC checksum
+- Attributes (compression, timestamps, etc.)
+- Record metadata (offsets, timestamps)
+- Actual records with keys/values
+
+We pass this through unchanged from disk to consumer.
+
+**Key Concepts:**
+- **Zero-copy**: Pass record batches directly from disk to network
+- **Batch-based**: Messages grouped in batches for efficiency
+- **Binary Format**: Raw bytes preserved from disk
+- **Varint Encoding**: Space-efficient for variable-length fields
+- **File Offsets**: Track position in log for sequential reads
+
+**Implementation Highlights:**
+```javascript
+// Read from disk
+const records = readPartitionLog(metadata.name, 0);
+
+// Calculate response size with varint length
+const lengthBytes = varintByteLength(recordsLength + 1);
+bodySize += lengthBytes + recordsLength;
+
+// Write varint + data
+let len = recordsLength + 1;
+while (len >= 128) {
+  responseBody.writeUInt8((len & 0x7F) | 0x80, offset);
+  len >>>= 7;
+}
+responseBody.writeUInt8(len & 0x7F, offset);
+records.copy(responseBody, offset);
+```
+
+**Consumer Flow:**
+1. Consumer sends Fetch request with topic UUID
+2. Broker looks up topic by UUID
+3. Broker reads partition log file
+4. Broker returns record batches
+5. Consumer deserializes messages
+6. Consumer processes data
+
+---
+
 ## 🔮 Future Stages (To Be Implemented)
 
-### Stage 13: Fetch with Actual Messages
-- Read messages from partition log files
-- Return record batches
-- Handle offsets correctly
-- Parse and encode Kafka record format
+### Stage 14: Advanced Fetch Features
+- Handle fetch offsets (start reading from specific position)
+- Support max bytes limit
+- Handle multiple partitions
+- Optimize large message handling
 
-### Stage 14: Topic Management  
+### Stage 15: Topic Management  
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 15: Produce API
+### Stage 16: Produce API
 - Accept messages from producers
 - Write events to partitions
 - Acknowledge successful writes
 
-### Stage 16: Message Storage
+### Stage 17: Message Storage
 - Persist messages to disk
 - Implement log segments
 - Support for log compaction
 
-### Stage 17: Replication (Advanced)
+### Stage 18: Replication (Advanced)
 - Multi-broker support
 - Leader election
 - Partition replication
@@ -1288,5 +1427,6 @@ The CodeCrafters platform provides automated tests that verify:
 ---
 
 **Last Updated:** January 8, 2026
-**Current Stage:** Stage 12 - Fetch API for Known Topic (No Messages) Complete
+**Current Stage:** Stage 13 - Fetch with Actual Messages Complete  
+**Total Lines of Code:** ~1,300 lines
 
