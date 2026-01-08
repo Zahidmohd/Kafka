@@ -1309,6 +1309,7 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
       if (recordsLength > 0) {
         recordBatch = data.slice(offset, offset + recordsLength);
         console.log(`  Captured ${recordsLength} bytes of record batch data`);
+        console.log(`  First 32 bytes of recordBatch:`, recordBatch.slice(0, 32).toString('hex'));
         offset += recordsLength;
       }
       
