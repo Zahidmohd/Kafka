@@ -1198,6 +1198,16 @@ function writeRecordBatchToLog(topicName, partitionIndex, recordBatch, baseOffse
     const actualRecordBatch = recordBatch.slice(12);
     console.log(`  Actual record batch length (after skipping 12-byte header): ${actualRecordBatch.length}`);
     
+    // Parse recordsCount from the RecordBatch to show how many records we're writing
+    // RecordBatch structure: partitionLeaderEpoch(4) + magic(1) + crc(4) + attributes(2) + 
+    //                        lastOffsetDelta(4) + baseTimestamp(8) + maxTimestamp(8) + 
+    //                        producerId(8) + producerEpoch(2) + baseSequence(4) + recordsCount(4)
+    // recordsCount is at offset 49 (4+1+4+2+4+8+8+8+2+4 = 45 + 4 for the count itself)
+    if (actualRecordBatch.length >= 49) {
+      const recordsCount = actualRecordBatch.readInt32BE(45);
+      console.log(`  Records in batch: ${recordsCount}`);
+    }
+    
     // Prepare log entry: baseOffset (8 bytes) + batchLength (4 bytes) + actualRecordBatch
     const logEntry = Buffer.alloc(8 + 4 + actualRecordBatch.length);
     let offset = 0;
