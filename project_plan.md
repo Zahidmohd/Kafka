@@ -585,18 +585,150 @@ if (topicExists) {
 
 ---
 
+### ✅ Stage 8: Handle Multiple Topics
+
+**Status:** COMPLETED
+
+**What it does:**
+- Parses multiple topic names from a single DescribeTopicPartitions request
+- Looks up metadata for each requested topic
+- **Sorts topics alphabetically by name** (required by protocol)
+- Returns metadata for all topics in a single response
+
+**Purpose:**
+Allows clients to query multiple topics efficiently in one request instead of making separate requests for each topic.
+
+**Key Implementation:**
+```javascript
+// Parse ALL topics from request
+const requestedTopics = [];
+for (let i = 0; i < topicsArrayLength; i++) {
+  const topicName = data.toString('utf8', offset, offset + topicNameLength);
+  requestedTopics.push(topicName);
+}
+
+// Look up metadata for each
+const topicsWithMetadata = [];
+for (const topicName of requestedTopics) {
+  let topicMetadata = topicsMetadata.get(topicName) || findTopicInLog(topicName);
+  topicsWithMetadata.push({ name: topicName, metadata: topicMetadata });
+}
+
+// Sort alphabetically (REQUIRED!)
+topicsWithMetadata.sort((a, b) => a.name.localeCompare(b.name));
+
+// Build response with all topics
+const responseBody = buildDescribeTopicPartitionsBodyMultiple(topicsWithMetadata);
+```
+
+**Response Structure:**
+```
+throttle_time_ms: 0
+topics array length: N+1 (COMPACT_ARRAY)
+  Topic 1 (alphabetically sorted):
+    error_code: 0 or 3
+    topic_name: "apple"
+    topic_id: <UUID>
+    partitions: [...]
+  Topic 2:
+    topic_name: "zebra"
+    ...
+next_cursor: -1
+```
+
+**Key Concepts:**
+- **Alphabetical Sorting**: Required by Kafka protocol for consistent ordering
+- **Batch Queries**: More efficient than individual requests
+- **Mixed Results**: Can include both known and unknown topics in response
+- **Independent Lookup**: Each topic is looked up independently
+
+---
+
+### ✅ Stage 9: Advertise Fetch API
+
+**Status:** COMPLETED
+
+**What it does:**
+- Adds Fetch API (API key 1) to the ApiVersions response
+- Advertises support for Fetch versions 0-16
+
+**Purpose:**
+The Fetch API is how consumers read messages from Kafka topics. By advertising it in ApiVersions, clients know the broker supports message consumption.
+
+**Updated ApiVersions Response:**
+```
+00 00 00 21  // message_size:      33 bytes (header 4 + body 29)
+XX XX XX XX  // correlation_id:    (echoed from request)
+00 00        // error_code:        0 (no error)
+04           // api_keys length:   4 = 3 elements (COMPACT_ARRAY encoding)
+
+// API entry 1: Fetch
+00 01        // api_key:           1 (Fetch)
+00 00        // min_version:       0
+00 10        // max_version:       16
+00           // TAG_BUFFER:        empty
+
+// API entry 2: ApiVersions
+00 12        // api_key:           18 (ApiVersions)
+00 00        // min_version:       0
+00 04        // max_version:       4
+00           // TAG_BUFFER:        empty
+
+// API entry 3: DescribeTopicPartitions
+00 4b        // api_key:           75 (DescribeTopicPartitions)
+00 00        // min_version:       0
+00 00        // max_version:       0
+00           // TAG_BUFFER:        empty
+
+00 00 00 00  // throttle_time_ms:  0
+00           // TAG_BUFFER:        empty
+```
+
+**Supported APIs (Now Advertised):**
+1. **API 1 (Fetch)**: versions 0-16
+   - Used by consumers to read messages
+   - Supports various options (offset, partition, max bytes, etc.)
+2. **API 18 (ApiVersions)**: versions 0-4
+3. **API 75 (DescribeTopicPartitions)**: version 0
+
+**What's the Fetch API?**
+The Fetch API allows Kafka consumers to:
+- Read messages from specific partitions
+- Specify starting offset (where to begin reading)
+- Control max bytes to fetch
+- Read from multiple partitions in one request
+- Get records in batches for efficiency
+
+**Key Concepts:**
+- **Consumer Operations**: Fetch is the primary API for consuming messages
+- **Version 16**: Modern version with many features (isolation level, session ID, etc.)
+- **API Discovery**: Clients check ApiVersions before using Fetch
+
+**Code Highlights:**
+```javascript
+// Now advertise 3 APIs instead of 2
+responseBody.writeUInt8(4, offset); // 3 elements + 1
+
+// Fetch API (1): versions 0-16
+responseBody.writeInt16BE(1, offset);   // api_key
+responseBody.writeInt16BE(0, offset);   // min_version
+responseBody.writeInt16BE(16, offset);  // max_version
+```
+
+---
+
 ## 🔮 Future Stages (To Be Implemented)
 
-### Stage 8: Handle Multiple Topics
-- Support multiple topics in a single request
-- Return metadata for multiple topics
+### Stage 10: Implement Fetch API Request Handling
+- Actually handle Fetch requests
+- Return messages from topics/partitions
 
-### Stage 9: Topic Management  
+### Stage 11: Topic Management  
 - Support for creating topics
 - Managing partitions
 - Topic configuration
 
-### Stage 10: Produce API
+### Stage 12: Produce API
 - Accept messages from producers
 - Write events to partitions
 - Acknowledge successful writes

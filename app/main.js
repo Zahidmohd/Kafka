@@ -796,18 +796,29 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   }
   
   // Build ApiVersions v4 response body
-  const responseBody = Buffer.alloc(22);
+  // Body size: error_code(2) + array_length(1) + 3*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 29 bytes
+  const responseBody = Buffer.alloc(29);
   let offset = 0;
   
   // error_code (INT16): 0
   responseBody.writeInt16BE(0, offset);
   offset += 2;
   
-  // api_keys (COMPACT_ARRAY): 2 entries = 3 in compact encoding
-  responseBody.writeUInt8(3, offset);
+  // api_keys (COMPACT_ARRAY): 3 entries = 4 in compact encoding
+  responseBody.writeUInt8(4, offset);
   offset += 1;
   
-  // API key entry 1: ApiVersions (18)
+  // API key entry 1: Fetch (1)
+  responseBody.writeInt16BE(1, offset);  // api_key
+  offset += 2;
+  responseBody.writeInt16BE(0, offset);  // min_version
+  offset += 2;
+  responseBody.writeInt16BE(16, offset); // max_version
+  offset += 2;
+  responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+  offset += 1;
+  
+  // API key entry 2: ApiVersions (18)
   responseBody.writeInt16BE(18, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -817,7 +828,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 2: DescribeTopicPartitions (75)
+  // API key entry 3: DescribeTopicPartitions (75)
   responseBody.writeInt16BE(75, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -835,7 +846,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);
   offset += 1;
   
-  // Calculate message_size: header (4 bytes) + body (22 bytes) = 26 bytes
+  // Calculate message_size: header (4 bytes) + body (29 bytes) = 33 bytes
   const messageSize = 4 + responseBody.length;
   
   // Create full response
