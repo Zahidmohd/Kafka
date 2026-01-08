@@ -1559,16 +1559,16 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   }
   
   // Build ApiVersions v4 response body
-  // Body size: error_code(2) + array_length(1) + 6*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 50 bytes
-  const responseBody = Buffer.alloc(50);
+  // Body size: error_code(2) + array_length(1) + 7*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 57 bytes
+  const responseBody = Buffer.alloc(57);
   let offset = 0;
   
   // error_code (INT16): 0
   responseBody.writeInt16BE(0, offset);
   offset += 2;
   
-  // api_keys (COMPACT_ARRAY): 6 entries = 7 in compact encoding
-  responseBody.writeUInt8(7, offset);
+  // api_keys (COMPACT_ARRAY): 7 entries = 8 in compact encoding
+  responseBody.writeUInt8(8, offset);
   offset += 1;
   
   // API key entry 1: Produce (0)
@@ -1621,7 +1621,17 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 6: DescribeTopicPartitions (75)
+  // API key entry 6: CreatePartitions (37)
+  responseBody.writeInt16BE(37, offset); // api_key
+  offset += 2;
+  responseBody.writeInt16BE(0, offset);  // min_version
+  offset += 2;
+  responseBody.writeInt16BE(3, offset);  // max_version
+  offset += 2;
+  responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+  offset += 1;
+  
+  // API key entry 7: DescribeTopicPartitions (75)
   responseBody.writeInt16BE(75, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -1968,6 +1978,189 @@ function handleCreateTopics(connection, requestApiVersion, correlationId, data) 
   connection.write(response);
 }
 
+// Handler for CreatePartitions API (API key 37)
+function handleCreatePartitions(connection, requestApiVersion, correlationId, data) {
+  console.log("Handling CreatePartitions request");
+  
+  // Parse CreatePartitions request
+  let offset = 12; // Skip message_size, api_key, api_version, correlation_id
+  
+  // Parse client_id (NULLABLE_STRING)
+  const clientIdLength = data.readInt16BE(offset);
+  offset += 2;
+  if (clientIdLength > 0) {
+    offset += clientIdLength;
+  }
+  
+  // TAG_BUFFER (header)
+  offset += 1;
+  
+  // Parse request body
+  // topics (COMPACT_ARRAY)
+  const topicsArrayLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  
+  console.log(`Adding partitions to ${topicsArrayLength} topic(s)`);
+  
+  const results = [];
+  
+  for (let i = 0; i < topicsArrayLength; i++) {
+    // name (COMPACT_STRING)
+    const nameLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    const topicName = data.toString('utf8', offset, offset + nameLength);
+    offset += nameLength;
+    
+    // count (INT32) - new total partition count
+    const newTotalCount = data.readInt32BE(offset);
+    offset += 4;
+    
+    // assignments (COMPACT_ARRAY) - skip for now
+    const assignmentsLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    // Skip assignments parsing
+    
+    // TAG_BUFFER (topic)
+    offset += 1;
+    
+    console.log(`  Topic: ${topicName}, New Total Partitions: ${newTotalCount}`);
+    
+    // Check if topic exists
+    const metadata = topicsMetadata.get(topicName);
+    let errorCode = 0;
+    let errorMessage = null;
+    
+    if (!metadata) {
+      errorCode = 3; // UNKNOWN_TOPIC_OR_PARTITION
+      errorMessage = "Topic does not exist";
+      console.log(`    ✗ Topic "${topicName}" not found`);
+    } else {
+      const currentCount = metadata.partitions.length;
+      
+      if (newTotalCount <= currentCount) {
+        errorCode = 37; // INVALID_PARTITIONS
+        errorMessage = `New partition count ${newTotalCount} must be greater than current count ${currentCount}`;
+        console.log(`    ✗ Invalid partition count: ${newTotalCount} <= ${currentCount}`);
+      } else {
+        const partitionsToAdd = newTotalCount - currentCount;
+        console.log(`    Adding ${partitionsToAdd} new partitions (${currentCount} → ${newTotalCount})`);
+        
+        try {
+          // Create new partition directories
+          for (let p = currentCount; p < newTotalCount; p++) {
+            const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${p}`;
+            if (!fs.existsSync(partitionDir)) {
+              fs.mkdirSync(partitionDir, { recursive: true });
+              console.log(`      Created partition directory: ${partitionDir}`);
+            }
+            
+            // Create empty log file
+            const logFile = `${partitionDir}/00000000000000000000.log`;
+            if (!fs.existsSync(logFile)) {
+              fs.writeFileSync(logFile, Buffer.alloc(0));
+              console.log(`      Created log file: ${logFile}`);
+            }
+            
+            // Add partition to metadata
+            metadata.partitions.push({
+              partitionId: p,
+              leader: 1,
+              replicas: [1],
+              isr: [1],
+              leaderEpoch: 0
+            });
+          }
+          
+          console.log(`    ✓ Successfully added ${partitionsToAdd} partitions to "${topicName}"`);
+        } catch (err) {
+          console.error(`    ✗ Error adding partitions to "${topicName}":`, err.message);
+          errorCode = 49; // INVALID_TOPIC_EXCEPTION
+          errorMessage = err.message;
+        }
+      }
+    }
+    
+    results.push({
+      name: topicName,
+      errorCode: errorCode,
+      errorMessage: errorMessage
+    });
+  }
+  
+  // timeout_ms (INT32) - skip
+  offset += 4;
+  
+  // validate_only (BOOLEAN) - skip
+  offset += 1;
+  
+  // TAG_BUFFER
+  offset += 1;
+  
+  // Build response
+  let bodySize = 4; // throttle_time_ms
+  bodySize += 1; // results array length
+  
+  for (const result of results) {
+    bodySize += 1; // name length
+    bodySize += result.name.length; // name
+    bodySize += 2; // error_code
+    bodySize += 1; // error_message (null = 0)
+    bodySize += 1; // TAG_BUFFER
+  }
+  
+  bodySize += 1; // TAG_BUFFER (final)
+  
+  const headerSize = 4 + 1; // correlation_id + TAG_BUFFER
+  const response = Buffer.alloc(4 + headerSize + bodySize);
+  let responseOffset = 0;
+  
+  // message_size
+  response.writeInt32BE(headerSize + bodySize, responseOffset);
+  responseOffset += 4;
+  
+  // Response Header v1
+  response.writeInt32BE(correlationId, responseOffset);
+  responseOffset += 4;
+  response.writeUInt8(0, responseOffset); // TAG_BUFFER
+  responseOffset += 1;
+  
+  // Response Body
+  // throttle_time_ms
+  response.writeInt32BE(0, responseOffset);
+  responseOffset += 4;
+  
+  // results array
+  response.writeUInt8(results.length + 1, responseOffset);
+  responseOffset += 1;
+  
+  for (const result of results) {
+    // name
+    response.writeUInt8(result.name.length + 1, responseOffset);
+    responseOffset += 1;
+    response.write(result.name, responseOffset, 'utf8');
+    responseOffset += result.name.length;
+    
+    // error_code
+    response.writeInt16BE(result.errorCode, responseOffset);
+    responseOffset += 2;
+    
+    // error_message (null)
+    response.writeUInt8(0, responseOffset);
+    responseOffset += 1;
+    
+    // TAG_BUFFER
+    response.writeUInt8(0, responseOffset);
+    responseOffset += 1;
+  }
+  
+  // TAG_BUFFER (final)
+  response.writeUInt8(0, responseOffset);
+  responseOffset += 1;
+  
+  console.log("Sending CreatePartitions response:", response.toString('hex'));
+  connection.write(response);
+}
+
 // Handler for DeleteTopics API (API key 20)
 function handleDeleteTopics(connection, requestApiVersion, correlationId, data) {
   console.log("Handling DeleteTopics request");
@@ -2168,6 +2361,9 @@ const server = net.createServer((connection) => {
     } else if (requestApiKey === 20) {
       // DeleteTopics API
       handleDeleteTopics(connection, requestApiVersion, correlationId, data);
+    } else if (requestApiKey === 37) {
+      // CreatePartitions API
+      handleCreatePartitions(connection, requestApiVersion, correlationId, data);
     } else if (requestApiKey === 75) {
       // DescribeTopicPartitions API
       handleDescribeTopicPartitions(connection, data, correlationId);
