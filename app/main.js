@@ -356,8 +356,8 @@ function buildDescribeTopicPartitionsBody(topicName, topicNameBytes, topicMetada
       bodySize += 4; // partition_index
       bodySize += 4; // leader_id
       bodySize += 4; // leader_epoch
-      bodySize += 1 + partition.replicas.length; // replica_nodes (compact array)
-      bodySize += 1 + partition.isr.length; // isr_nodes (compact array)
+      bodySize += 1 + (partition.replicas.length * 4); // replica_nodes (compact array: length + INT32 values)
+      bodySize += 1 + (partition.isr.length * 4); // isr_nodes (compact array: length + INT32 values)
       bodySize += 1; // eligible_leader_replicas (empty)
       bodySize += 1; // last_known_elr (empty)
       bodySize += 1; // offline_replicas (empty)
@@ -429,20 +429,20 @@ function buildDescribeTopicPartitionsBody(topicName, topicNameBytes, topicMetada
       responseBody.writeInt32BE(partition.leaderEpoch || 0, offset);
       offset += 4;
       
-      // replica_nodes (COMPACT_ARRAY)
+      // replica_nodes (COMPACT_ARRAY of INT32)
       responseBody.writeUInt8(partition.replicas.length + 1, offset);
       offset += 1;
       for (const replica of partition.replicas) {
-        responseBody.writeInt8(replica, offset);
-        offset += 1;
+        responseBody.writeInt32BE(replica, offset);
+        offset += 4;
       }
       
-      // isr_nodes (COMPACT_ARRAY)
+      // isr_nodes (COMPACT_ARRAY of INT32)
       responseBody.writeUInt8(partition.isr.length + 1, offset);
       offset += 1;
       for (const isr of partition.isr) {
-        responseBody.writeInt8(isr, offset);
-        offset += 1;
+        responseBody.writeInt32BE(isr, offset);
+        offset += 4;
       }
       
       // eligible_leader_replicas (COMPACT_ARRAY): empty
