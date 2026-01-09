@@ -1742,7 +1742,596 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
 
 // Handler for ApiVersions API (API key 18)
 // Consumer group health tracking
-const consumerGroups = new Map(); // groupId -> { members: Map<memberId, { lastHeartbeat, generation }> }
+const consumerGroups = new Map(); // groupId -> { members: Map<memberId, { lastHeartbeat, generation, assignments }>, offsets: Map<topic-partition, offset> }
+
+// Handle OffsetCommit API (API key 8)
+function handleOffsetCommit(connection, requestApiVersion, correlationId, data) {
+  log('info', "Handling OffsetCommit request");
+  
+  // Parse OffsetCommit request (v8)
+  let offset = 12;
+  
+  // Skip client_id
+  const clientIdLength = data.readInt16BE(offset);
+  offset += 2;
+  if (clientIdLength > 0) {
+    offset += clientIdLength;
+  }
+  offset += 1; // TAG_BUFFER
+  
+  // Parse group_id
+  const groupIdLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  const groupId = data.toString('utf8', offset, offset + groupIdLength);
+  offset += groupIdLength;
+  
+  // Parse generation_id
+  const generationId = data.readInt32BE(offset);
+  offset += 4;
+  
+  // Parse member_id
+  const memberIdLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  const memberId = data.toString('utf8', offset, offset + memberIdLength);
+  offset += memberIdLength;
+  
+  // Skip group_instance_id
+  const groupInstanceIdLength = data.readUInt8(offset);
+  offset += 1;
+  if (groupInstanceIdLength > 0) {
+    offset += groupInstanceIdLength - 1;
+  }
+  
+  // Parse topics array
+  const topicsCount = data.readUInt8(offset) - 1;
+  offset += 1;
+  
+  const commitResults = [];
+  
+  for (let i = 0; i < topicsCount; i++) {
+    // Topic name
+    const topicNameLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    const topicName = data.toString('utf8', offset, offset + topicNameLength);
+    offset += topicNameLength;
+    
+    // Partitions array
+    const partitionsCount = data.readUInt8(offset) - 1;
+    offset += 1;
+    
+    const partitionResults = [];
+    
+    for (let j = 0; j < partitionsCount; j++) {
+      // Partition index
+      const partitionIndex = data.readInt32BE(offset);
+      offset += 4;
+      
+      // Committed offset
+      const committedOffset = data.readBigInt64BE(offset);
+      offset += 8;
+      
+      // Committed leader epoch
+      const committedLeaderEpoch = data.readInt32BE(offset);
+      offset += 4;
+      
+      // Metadata (COMPACT_NULLABLE_STRING)
+      const metadataLength = data.readUInt8(offset);
+      offset += 1;
+      if (metadataLength > 0) {
+        offset += metadataLength - 1;
+      }
+      
+      // TAG_BUFFER
+      offset += 1;
+      
+      // Store offset
+      if (!consumerGroups.has(groupId)) {
+        consumerGroups.set(groupId, {
+          members: new Map(),
+          generation: generationId,
+          offsets: new Map()
+        });
+      }
+      
+      const group = consumerGroups.get(groupId);
+      const offsetKey = `${topicName}-${partitionIndex}`;
+      group.offsets.set(offsetKey, {
+        offset: committedOffset,
+        leaderEpoch: committedLeaderEpoch,
+        metadata: null,
+        commitTime: Date.now()
+      });
+      
+      log('debug', `Committed offset for ${offsetKey} in group ${groupId}: ${committedOffset}`);
+      
+      partitionResults.push({
+        partitionIndex,
+        errorCode: 0 // NO_ERROR
+      });
+    }
+    
+    // TAG_BUFFER
+    offset += 1;
+    
+    commitResults.push({
+      topicName,
+      partitions: partitionResults
+    });
+  }
+  
+  // Build response
+  let responseBodyParts = [];
+  
+  // TAG_BUFFER (header)
+  responseBodyParts.push(Buffer.from([0]));
+  
+  // throttle_time_ms
+  const throttleBuf = Buffer.alloc(4);
+  throttleBuf.writeInt32BE(0, 0);
+  responseBodyParts.push(throttleBuf);
+  
+  // topics array length
+  responseBodyParts.push(Buffer.from([commitResults.length + 1]));
+  
+  for (const topic of commitResults) {
+    // Topic name
+    const nameBuf = Buffer.alloc(1 + topic.topicName.length);
+    nameBuf.writeUInt8(topic.topicName.length + 1, 0);
+    nameBuf.write(topic.topicName, 1, 'utf8');
+    responseBodyParts.push(nameBuf);
+    
+    // Partitions array length
+    responseBodyParts.push(Buffer.from([topic.partitions.length + 1]));
+    
+    for (const partition of topic.partitions) {
+      const partBuf = Buffer.alloc(4 + 2 + 1);
+      let pOff = 0;
+      
+      // partition_index
+      partBuf.writeInt32BE(partition.partitionIndex, pOff);
+      pOff += 4;
+      
+      // error_code
+      partBuf.writeInt16BE(partition.errorCode, pOff);
+      pOff += 2;
+      
+      // TAG_BUFFER
+      partBuf.writeUInt8(0, pOff);
+      pOff += 1;
+      
+      responseBodyParts.push(partBuf);
+    }
+    
+    // TAG_BUFFER
+    responseBodyParts.push(Buffer.from([0]));
+  }
+  
+  // TAG_BUFFER (final)
+  responseBodyParts.push(Buffer.from([0]));
+  
+  const responseBody = Buffer.concat(responseBodyParts);
+  const messageSize = 4 + responseBody.length;
+  const response = Buffer.alloc(4 + messageSize);
+  response.writeInt32BE(messageSize, 0);
+  response.writeInt32BE(correlationId, 4);
+  responseBody.copy(response, 8);
+  
+  log('debug', `Sending OffsetCommit response`);
+  connection.write(response);
+}
+
+// Handle OffsetFetch API (API key 9)
+function handleOffsetFetch(connection, requestApiVersion, correlationId, data) {
+  log('info', "Handling OffsetFetch request");
+  
+  // Parse OffsetFetch request (v8)
+  let offset = 12;
+  
+  // Skip client_id
+  const clientIdLength = data.readInt16BE(offset);
+  offset += 2;
+  if (clientIdLength > 0) {
+    offset += clientIdLength;
+  }
+  offset += 1; // TAG_BUFFER
+  
+  // Parse group_id
+  const groupIdLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  const groupId = data.toString('utf8', offset, offset + groupIdLength);
+  offset += groupIdLength;
+  
+  // Parse topics array (nullable)
+  const topicsCount = data.readUInt8(offset);
+  offset += 1;
+  
+  const requestedTopics = [];
+  if (topicsCount > 0) {
+    for (let i = 0; i < topicsCount - 1; i++) {
+      // Topic name
+      const topicNameLength = data.readUInt8(offset) - 1;
+      offset += 1;
+      const topicName = data.toString('utf8', offset, offset + topicNameLength);
+      offset += topicNameLength;
+      
+      // Partitions array
+      const partitionsCount = data.readUInt8(offset) - 1;
+      offset += 1;
+      
+      const partitions = [];
+      for (let j = 0; j < partitionsCount; j++) {
+        const partitionIndex = data.readInt32BE(offset);
+        offset += 4;
+        partitions.push(partitionIndex);
+      }
+      
+      // TAG_BUFFER
+      offset += 1;
+      
+      requestedTopics.push({ topicName, partitions });
+    }
+  }
+  
+  log('debug', `Fetching offsets for group ${groupId}`);
+  
+  // Get group offsets
+  const group = consumerGroups.get(groupId);
+  const responseTopics = [];
+  
+  if (group && requestedTopics.length > 0) {
+    for (const topic of requestedTopics) {
+      const partitionData = [];
+      
+      for (const partitionIndex of topic.partitions) {
+        const offsetKey = `${topic.topicName}-${partitionIndex}`;
+        const offsetData = group.offsets.get(offsetKey);
+        
+        if (offsetData) {
+          partitionData.push({
+            partitionIndex,
+            committedOffset: offsetData.offset,
+            committedLeaderEpoch: offsetData.leaderEpoch,
+            metadata: offsetData.metadata,
+            errorCode: 0
+          });
+        } else {
+          // No offset committed yet
+          partitionData.push({
+            partitionIndex,
+            committedOffset: -1n,
+            committedLeaderEpoch: -1,
+            metadata: null,
+            errorCode: 0
+          });
+        }
+      }
+      
+      responseTopics.push({
+        topicName: topic.topicName,
+        partitions: partitionData
+      });
+    }
+  }
+  
+  // Build response
+  let responseBodyParts = [];
+  
+  // TAG_BUFFER (header)
+  responseBodyParts.push(Buffer.from([0]));
+  
+  // throttle_time_ms
+  const throttleBuf = Buffer.alloc(4);
+  throttleBuf.writeInt32BE(0, 0);
+  responseBodyParts.push(throttleBuf);
+  
+  // topics array length
+  responseBodyParts.push(Buffer.from([responseTopics.length + 1]));
+  
+  for (const topic of responseTopics) {
+    // Topic name
+    const nameBuf = Buffer.alloc(1 + topic.topicName.length);
+    nameBuf.writeUInt8(topic.topicName.length + 1, 0);
+    nameBuf.write(topic.topicName, 1, 'utf8');
+    responseBodyParts.push(nameBuf);
+    
+    // Partitions array length
+    responseBodyParts.push(Buffer.from([topic.partitions.length + 1]));
+    
+    for (const partition of topic.partitions) {
+      const partBuf = Buffer.alloc(4 + 8 + 4 + 1 + 2 + 1);
+      let pOff = 0;
+      
+      // partition_index
+      partBuf.writeInt32BE(partition.partitionIndex, pOff);
+      pOff += 4;
+      
+      // committed_offset
+      partBuf.writeBigInt64BE(partition.committedOffset, pOff);
+      pOff += 8;
+      
+      // committed_leader_epoch
+      partBuf.writeInt32BE(partition.committedLeaderEpoch, pOff);
+      pOff += 4;
+      
+      // metadata (COMPACT_NULLABLE_STRING): null
+      partBuf.writeUInt8(0, pOff);
+      pOff += 1;
+      
+      // error_code
+      partBuf.writeInt16BE(partition.errorCode, pOff);
+      pOff += 2;
+      
+      // TAG_BUFFER
+      partBuf.writeUInt8(0, pOff);
+      pOff += 1;
+      
+      responseBodyParts.push(partBuf);
+    }
+    
+    // TAG_BUFFER
+    responseBodyParts.push(Buffer.from([0]));
+  }
+  
+  // error_code (global)
+  const errorBuf = Buffer.alloc(2);
+  errorBuf.writeInt16BE(0, 0);
+  responseBodyParts.push(errorBuf);
+  
+  // TAG_BUFFER (final)
+  responseBodyParts.push(Buffer.from([0]));
+  
+  const responseBody = Buffer.concat(responseBodyParts);
+  const messageSize = 4 + responseBody.length;
+  const response = Buffer.alloc(4 + messageSize);
+  response.writeInt32BE(messageSize, 0);
+  response.writeInt32BE(correlationId, 4);
+  responseBody.copy(response, 8);
+  
+  log('debug', `Sending OffsetFetch response with ${responseTopics.length} topics`);
+  connection.write(response);
+}
+
+// Handle JoinGroup API (API key 11)
+function handleJoinGroup(connection, requestApiVersion, correlationId, data) {
+  log('info', "Handling JoinGroup request");
+  
+  // Parse JoinGroup request (v9)
+  let offset = 12;
+  
+  // Skip client_id
+  const clientIdLength = data.readInt16BE(offset);
+  offset += 2;
+  if (clientIdLength > 0) {
+    offset += clientIdLength;
+  }
+  offset += 1; // TAG_BUFFER
+  
+  // Parse group_id
+  const groupIdLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  const groupId = data.toString('utf8', offset, offset + groupIdLength);
+  offset += groupIdLength;
+  
+  // Parse session_timeout_ms
+  const sessionTimeoutMs = data.readInt32BE(offset);
+  offset += 4;
+  
+  // Parse rebalance_timeout_ms
+  const rebalanceTimeoutMs = data.readInt32BE(offset);
+  offset += 4;
+  
+  // Parse member_id
+  const memberIdLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  const memberId = memberIdLength > 0 ? data.toString('utf8', offset, offset + memberIdLength) : "";
+  if (memberIdLength > 0) {
+    offset += memberIdLength;
+  }
+  
+  log('debug', `JoinGroup: group=${groupId}, memberId=${memberId || 'NEW'}`);
+  
+  // Create or get group
+  if (!consumerGroups.has(groupId)) {
+    consumerGroups.set(groupId, {
+      members: new Map(),
+      generation: 1,
+      offsets: new Map(),
+      leader: null
+    });
+  }
+  
+  const group = consumerGroups.get(groupId);
+  
+  // Generate member ID if new
+  const finalMemberId = memberId || `consumer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  
+  // Determine if this member is the leader
+  if (!group.leader || group.members.size === 0) {
+    group.leader = finalMemberId;
+    log('info', `Elected ${finalMemberId} as leader of group ${groupId}`);
+  }
+  
+  // Add member to group
+  group.members.set(finalMemberId, {
+    lastHeartbeat: Date.now(),
+    generation: group.generation,
+    sessionTimeoutMs,
+    rebalanceTimeoutMs
+  });
+  
+  // Build response
+  const responseBodyParts = [];
+  
+  // TAG_BUFFER (header)
+  responseBodyParts.push(Buffer.from([0]));
+  
+  // throttle_time_ms
+  const throttleBuf = Buffer.alloc(4);
+  throttleBuf.writeInt32BE(0, 0);
+  responseBodyParts.push(throttleBuf);
+  
+  // error_code
+  const errorBuf = Buffer.alloc(2);
+  errorBuf.writeInt16BE(0, 0); // NO_ERROR
+  responseBodyParts.push(errorBuf);
+  
+  // generation_id
+  const genBuf = Buffer.alloc(4);
+  genBuf.writeInt32BE(group.generation, 0);
+  responseBodyParts.push(genBuf);
+  
+  // protocol_type (COMPACT_NULLABLE_STRING): null for now
+  responseBodyParts.push(Buffer.from([0]));
+  
+  // protocol_name (COMPACT_NULLABLE_STRING): null for now
+  responseBodyParts.push(Buffer.from([0]));
+  
+  // leader (COMPACT_STRING)
+  const leaderBuf = Buffer.alloc(1 + group.leader.length);
+  leaderBuf.writeUInt8(group.leader.length + 1, 0);
+  leaderBuf.write(group.leader, 1, 'utf8');
+  responseBodyParts.push(leaderBuf);
+  
+  // member_id (COMPACT_STRING)
+  const memberBuf = Buffer.alloc(1 + finalMemberId.length);
+  memberBuf.writeUInt8(finalMemberId.length + 1, 0);
+  memberBuf.write(finalMemberId, 1, 'utf8');
+  responseBodyParts.push(memberBuf);
+  
+  // members array (empty for now)
+  responseBodyParts.push(Buffer.from([1])); // 0 + 1
+  
+  // TAG_BUFFER (final)
+  responseBodyParts.push(Buffer.from([0]));
+  
+  const responseBody = Buffer.concat(responseBodyParts);
+  const messageSize = 4 + responseBody.length;
+  const response = Buffer.alloc(4 + messageSize);
+  response.writeInt32BE(messageSize, 0);
+  response.writeInt32BE(correlationId, 4);
+  responseBody.copy(response, 8);
+  
+  log('debug', `Sending JoinGroup response: memberId=${finalMemberId}, generation=${group.generation}`);
+  connection.write(response);
+}
+
+// Handle LeaveGroup API (API key 13)
+function handleLeaveGroup(connection, requestApiVersion, correlationId, data) {
+  log('info', "Handling LeaveGroup request");
+  
+  // Parse LeaveGroup request (v5)
+  let offset = 12;
+  
+  // Skip client_id
+  const clientIdLength = data.readInt16BE(offset);
+  offset += 2;
+  if (clientIdLength > 0) {
+    offset += clientIdLength;
+  }
+  offset += 1; // TAG_BUFFER
+  
+  // Parse group_id
+  const groupIdLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  const groupId = data.toString('utf8', offset, offset + groupIdLength);
+  offset += groupIdLength;
+  
+  // Parse members array
+  const membersCount = data.readUInt8(offset) - 1;
+  offset += 1;
+  
+  const removedMembers = [];
+  
+  for (let i = 0; i < membersCount; i++) {
+    // member_id
+    const memberIdLength = data.readUInt8(offset) - 1;
+    offset += 1;
+    const memberId = data.toString('utf8', offset, offset + memberIdLength);
+    offset += memberIdLength;
+    
+    // group_instance_id (nullable)
+    const groupInstanceIdLength = data.readUInt8(offset);
+    offset += 1;
+    if (groupInstanceIdLength > 0) {
+      offset += groupInstanceIdLength - 1;
+    }
+    
+    // TAG_BUFFER
+    offset += 1;
+    
+    // Remove member from group
+    const group = consumerGroups.get(groupId);
+    let errorCode = 0;
+    
+    if (group && group.members.has(memberId)) {
+      group.members.delete(memberId);
+      log('info', `Removed member ${memberId} from group ${groupId}`);
+      
+      // If leader left, elect new leader
+      if (group.leader === memberId && group.members.size > 0) {
+        group.leader = Array.from(group.members.keys())[0];
+        log('info', `New leader elected: ${group.leader}`);
+      }
+      
+      errorCode = 0; // NO_ERROR
+    } else {
+      errorCode = 25; // UNKNOWN_MEMBER_ID
+    }
+    
+    removedMembers.push({ memberId, errorCode });
+  }
+  
+  // Build response
+  const responseBodyParts = [];
+  
+  // TAG_BUFFER (header)
+  responseBodyParts.push(Buffer.from([0]));
+  
+  // throttle_time_ms
+  const throttleBuf = Buffer.alloc(4);
+  throttleBuf.writeInt32BE(0, 0);
+  responseBodyParts.push(throttleBuf);
+  
+  // error_code (global)
+  const errorBuf = Buffer.alloc(2);
+  errorBuf.writeInt16BE(0, 0);
+  responseBodyParts.push(errorBuf);
+  
+  // members array length
+  responseBodyParts.push(Buffer.from([removedMembers.length + 1]));
+  
+  for (const member of removedMembers) {
+    // member_id
+    const memberBuf = Buffer.alloc(1 + member.memberId.length);
+    memberBuf.writeUInt8(member.memberId.length + 1, 0);
+    memberBuf.write(member.memberId, 1, 'utf8');
+    responseBodyParts.push(memberBuf);
+    
+    // group_instance_id (null)
+    responseBodyParts.push(Buffer.from([0]));
+    
+    // error_code
+    const errBuf = Buffer.alloc(2);
+    errBuf.writeInt16BE(member.errorCode, 0);
+    responseBodyParts.push(errBuf);
+    
+    // TAG_BUFFER
+    responseBodyParts.push(Buffer.from([0]));
+  }
+  
+  // TAG_BUFFER (final)
+  responseBodyParts.push(Buffer.from([0]));
+  
+  const responseBody = Buffer.concat(responseBodyParts);
+  const messageSize = 4 + responseBody.length;
+  const response = Buffer.alloc(4 + messageSize);
+  response.writeInt32BE(messageSize, 0);
+  response.writeInt32BE(correlationId, 4);
+  responseBody.copy(response, 8);
+  
+  log('debug', `Sending LeaveGroup response for ${removedMembers.length} members`);
+  connection.write(response);
+}
 
 // Handle Heartbeat API (API key 12)
 function handleHeartbeat(connection, requestApiVersion, correlationId, data) {
@@ -2089,16 +2678,16 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   }
   
   // Build ApiVersions v4 response body
-  // Body size: error_code(2) + array_length(1) + 10*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 78 bytes
-  const responseBody = Buffer.alloc(78);
+  // Body size: error_code(2) + array_length(1) + 14*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 106 bytes
+  const responseBody = Buffer.alloc(106);
   let offset = 0;
   
   // error_code (INT16): 0
   responseBody.writeInt16BE(0, offset);
   offset += 2;
   
-  // api_keys (COMPACT_ARRAY): 10 entries = 11 in compact encoding
-  responseBody.writeUInt8(11, offset);
+  // api_keys (COMPACT_ARRAY): 14 entries = 15 in compact encoding
+  responseBody.writeUInt8(15, offset);
   offset += 1;
   
   // API key entry 1: Produce (0)
@@ -2131,7 +2720,37 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 4: Heartbeat (12)
+  // API key entry 4: OffsetCommit (8)
+  responseBody.writeInt16BE(8, offset);  // api_key
+  offset += 2;
+  responseBody.writeInt16BE(0, offset);  // min_version
+  offset += 2;
+  responseBody.writeInt16BE(8, offset); // max_version
+  offset += 2;
+  responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+  offset += 1;
+  
+  // API key entry 5: OffsetFetch (9)
+  responseBody.writeInt16BE(9, offset);  // api_key
+  offset += 2;
+  responseBody.writeInt16BE(0, offset);  // min_version
+  offset += 2;
+  responseBody.writeInt16BE(8, offset); // max_version
+  offset += 2;
+  responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+  offset += 1;
+  
+  // API key entry 6: JoinGroup (11)
+  responseBody.writeInt16BE(11, offset);  // api_key
+  offset += 2;
+  responseBody.writeInt16BE(0, offset);  // min_version
+  offset += 2;
+  responseBody.writeInt16BE(9, offset); // max_version
+  offset += 2;
+  responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+  offset += 1;
+  
+  // API key entry 7: Heartbeat (12)
   responseBody.writeInt16BE(12, offset);  // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2141,7 +2760,17 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 5: ApiVersions (18)
+  // API key entry 8: LeaveGroup (13)
+  responseBody.writeInt16BE(13, offset);  // api_key
+  offset += 2;
+  responseBody.writeInt16BE(0, offset);  // min_version
+  offset += 2;
+  responseBody.writeInt16BE(5, offset); // max_version
+  offset += 2;
+  responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+  offset += 1;
+  
+  // API key entry 9: ApiVersions (18)
   responseBody.writeInt16BE(18, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2151,7 +2780,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 6: CreateTopics (19)
+  // API key entry 10: CreateTopics (19)
   responseBody.writeInt16BE(19, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2161,7 +2790,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 7: DeleteTopics (20)
+  // API key entry 11: DeleteTopics (20)
   responseBody.writeInt16BE(20, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2171,7 +2800,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 8: EndTxn (26)
+  // API key entry 12: EndTxn (26)
   responseBody.writeInt16BE(26, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2181,7 +2810,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 9: CreatePartitions (37)
+  // API key entry 13: CreatePartitions (37)
   responseBody.writeInt16BE(37, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2191,7 +2820,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 10: DescribeTopicPartitions (75)
+  // API key entry 14: DescribeTopicPartitions (75)
   responseBody.writeInt16BE(75, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -3141,9 +3770,21 @@ const server = net.createServer((connection) => {
     } else if (requestApiKey === 3) {
       // Metadata API
       handleMetadata(connection, requestApiVersion, correlationId, data);
+    } else if (requestApiKey === 8) {
+      // OffsetCommit API
+      handleOffsetCommit(connection, requestApiVersion, correlationId, data);
+    } else if (requestApiKey === 9) {
+      // OffsetFetch API
+      handleOffsetFetch(connection, requestApiVersion, correlationId, data);
+    } else if (requestApiKey === 11) {
+      // JoinGroup API
+      handleJoinGroup(connection, requestApiVersion, correlationId, data);
     } else if (requestApiKey === 12) {
       // Heartbeat API
       handleHeartbeat(connection, requestApiVersion, correlationId, data);
+    } else if (requestApiKey === 13) {
+      // LeaveGroup API
+      handleLeaveGroup(connection, requestApiVersion, correlationId, data);
     } else if (requestApiKey === 18) {
       // ApiVersions API
       handleApiVersions(connection, requestApiVersion, correlationId);
