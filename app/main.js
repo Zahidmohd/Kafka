@@ -1,9 +1,67 @@
 import net from "net";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 
-// You can use print statements as follows for debugging, they'll be visible when running tests.
-console.log("Logs from your program will appear here!");
+// Get directory name in ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Load configuration
+function loadConfig() {
+  const configPath = path.join(__dirname, '..', 'config.json');
+  try {
+    if (fs.existsSync(configPath)) {
+      const configData = fs.readFileSync(configPath, 'utf8');
+      return JSON.parse(configData);
+    }
+  } catch (err) {
+    console.log('Could not load config.json, using defaults:', err.message);
+  }
+  
+  // Default configuration
+  return {
+    broker: { id: 1, host: "127.0.0.1", port: 9092 },
+    replication: { factor: 1, minInsyncReplicas: 1 },
+    log: { 
+      dir: "/tmp/kraft-combined-logs",
+      retentionMs: 604800000,
+      segmentBytes: 1073741824,
+      flushMessages: 10000
+    },
+    transaction: { timeoutMs: 60000, maxTimeoutMs: 900000 },
+    network: {
+      maxRequestSize: 1048576,
+      socketSendBufferBytes: 102400,
+      socketReceiveBufferBytes: 102400
+    },
+    logging: { level: "info" }
+  };
+}
+
+const config = loadConfig();
+
+// Override with environment variables
+const BROKER_ID = parseInt(process.env.BROKER_ID || config.broker.id);
+const BROKER_PORT = parseInt(process.env.BROKER_PORT || config.broker.port);
+const REPLICATION_FACTOR = parseInt(process.env.REPLICATION_FACTOR || config.replication.factor);
+const LOG_DIR = process.env.LOG_DIR || config.log.dir;
+const LOG_LEVEL = process.env.LOG_LEVEL || config.logging.level;
+
+// Logging levels
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+const CURRENT_LOG_LEVEL = LOG_LEVELS[LOG_LEVEL] || LOG_LEVELS.info;
+
+function log(level, ...args) {
+  if (LOG_LEVELS[level] >= CURRENT_LOG_LEVEL) {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] [${level.toUpperCase()}]`, ...args);
+  }
+}
+
+log('info', "Kafka Broker starting...");
+log('info', `Broker ID: ${BROKER_ID}, Port: ${BROKER_PORT}, Replication Factor: ${REPLICATION_FACTOR}`);
+log('info', `Log Directory: ${LOG_DIR}, Log Level: ${LOG_LEVEL}`);
 
 // Store topic metadata in memory (cache)
 const topicsMetadata = new Map();
@@ -13,12 +71,6 @@ const transactions = new Map(); // transactionalId -> { producerId, producerEpoc
 
 // Store replication state for high availability
 const replicationState = new Map(); // partitionKey -> { leader, followers, isr, lastUpdated }
-
-// Broker configuration
-const BROKER_ID = parseInt(process.env.BROKER_ID || '1');
-const REPLICATION_FACTOR = parseInt(process.env.REPLICATION_FACTOR || '1');
-
-console.log(`Broker ID: ${BROKER_ID}, Replication Factor: ${REPLICATION_FACTOR}`);
 
 // Helper: Initialize replication for a partition
 function initializeReplication(topicName, partitionIndex, replicationFactor) {
@@ -130,7 +182,7 @@ function getReplicationInfo(topicName, partitionIndex) {
 
 // Helper: Read messages from partition log file
 function readPartitionLog(topicName, partitionId) {
-  const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partitionId}`;
+  const partitionDir = `${LOG_DIR}/${topicName}-${partitionId}`;
   const logFile = `${partitionDir}/00000000000000000000.log`;
   
   console.log(`Reading partition log: ${logFile}`);
@@ -208,7 +260,7 @@ function findTopicByUUID(topicUUID) {
   }
   
   // Not in cache, search the log file
-  const logPath = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log";
+  const logPath = `${LOG_DIR}/__cluster_metadata-0/00000000000000000000.log`;
   
   try {
     if (!fs.existsSync(logPath)) {
@@ -261,7 +313,7 @@ function findTopicByUUID(topicUUID) {
 
 // Simple and reliable approach: search for topic name in log file
 function findTopicInLog(topicName) {
-  const logPath = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log";
+  const logPath = `${LOG_DIR}/__cluster_metadata-0/00000000000000000000.log`;
   
   try {
     if (!fs.existsSync(logPath)) {
@@ -1298,12 +1350,12 @@ function buildFetchResponseBody(requestedTopics) {
 
 // Helper: Write record batch to partition log file
 function writeRecordBatchToLog(topicName, partitionIndex, recordBatch, baseOffset = 0) {
-  const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partitionIndex}`;
+  const partitionDir = `${LOG_DIR}/${topicName}-${partitionIndex}`;
   const logFile = `${partitionDir}/00000000000000000000.log`;
   
-  console.log(`Writing record batch to: ${logFile}`);
-  console.log(`  Base offset: ${baseOffset}`);
-  console.log(`  Original batch length: ${recordBatch.length}`);
+  log('debug', `Writing record batch to: ${logFile}`);
+  log('debug', `  Base offset: ${baseOffset}`);
+  log('debug', `  Original batch length: ${recordBatch.length}`);
   
   try {
     // Create partition directory if it doesn't exist
@@ -2060,7 +2112,7 @@ function handleEndTxn(connection, requestApiVersion, correlationId, data) {
 
 // Helper: Write transaction marker to partition log
 function writeTransactionMarker(topicName, partitionIndex, producerId, producerEpoch, commit) {
-  const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partitionIndex}`;
+  const partitionDir = `${LOG_DIR}/${topicName}-${partitionIndex}`;
   const logFile = `${partitionDir}/00000000000000000000.log`;
   
   console.log(`  Writing ${commit ? 'COMMIT' : 'ABORT'} marker to ${topicName}-${partitionIndex}`);
@@ -2226,7 +2278,7 @@ function handleCreateTopics(connection, requestApiVersion, correlationId, data) 
       const partitionMetadata = [];
       
       for (let p = 0; p < numPartitions; p++) {
-        const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${p}`;
+        const partitionDir = `${LOG_DIR}/${topicName}-${p}`;
         if (!fs.existsSync(partitionDir)) {
           fs.mkdirSync(partitionDir, { recursive: true });
           console.log(`    Created partition directory: ${partitionDir}`);
@@ -2431,7 +2483,7 @@ function handleCreatePartitions(connection, requestApiVersion, correlationId, da
         try {
           // Create new partition directories
           for (let p = currentCount; p < newTotalCount; p++) {
-            const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${p}`;
+            const partitionDir = `${LOG_DIR}/${topicName}-${p}`;
             if (!fs.existsSync(partitionDir)) {
               fs.mkdirSync(partitionDir, { recursive: true });
               console.log(`      Created partition directory: ${partitionDir}`);
@@ -2599,7 +2651,7 @@ function handleDeleteTopics(connection, requestApiVersion, correlationId, data) 
         
         // Delete partition directories
         for (const partition of metadata.partitions) {
-          const partitionDir = `/tmp/kraft-combined-logs/${topicName}-${partition.partitionId}`;
+          const partitionDir = `${LOG_DIR}/${topicName}-${partition.partitionId}`;
           if (fs.existsSync(partitionDir)) {
             // Delete log file first
             const logFile = `${partitionDir}/00000000000000000000.log`;
@@ -2763,6 +2815,7 @@ const server = net.createServer((connection) => {
   });
 });
 
-server.listen(9092, "127.0.0.1", () => {
-  console.log("Kafka broker listening on port 9092");
+server.listen(BROKER_PORT, config.broker.host, () => {
+  log('info', `Kafka broker listening on ${config.broker.host}:${BROKER_PORT}`);
+  log('info', `Configuration loaded from ${config ? 'config.json' : 'defaults'}`);
 });

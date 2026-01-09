@@ -1,0 +1,30 @@
+{
+  "broker": {
+    "id": 1,
+    "host": "127.0.0.1",
+    "port": 9092
+  },
+  "replication": {
+    "factor": 3,
+    "minInsyncReplicas": 2
+  },
+  "log": {
+    "dir": "/tmp/kraft-combined-logs",
+    "retentionMs": 604800000,
+    "segmentBytes": 1073741824,
+    "flushMessages": 10000
+  },
+  "transaction": {
+    "timeoutMs": 60000,
+    "maxTimeoutMs": 900000
+  },
+  "network": {
+    "maxRequestSize": 1048576,
+    "socketSendBufferBytes": 102400,
+    "socketReceiveBufferBytes": 102400
+  },
+  "logging": {
+    "level": "info"
+  }
+}
+
