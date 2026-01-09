@@ -1,6 +1,7 @@
 import net from "net";
 import fs from "fs";
 import path from "path";
+import zlib from "zlib";
 import { fileURLToPath } from "url";
 
 // Get directory name in ESM
@@ -1348,6 +1349,112 @@ function buildFetchResponseBody(requestedTopics) {
   return responseBody;
 }
 
+// Compression helper functions
+const COMPRESSION_NONE = 0;
+const COMPRESSION_GZIP = 1;
+const COMPRESSION_SNAPPY = 2;
+const COMPRESSION_LZ4 = 3;
+const COMPRESSION_ZSTD = 4;
+
+function getCompressionType(attributes) {
+  // Compression codec is in the lower 3 bits of attributes
+  return attributes & 0x07;
+}
+
+function decompressRecordBatch(recordBatchData) {
+  try {
+    // Read attributes from the recordBatch (at offset 8 from start of batch data)
+    if (recordBatchData.length < 10) {
+      return recordBatchData; // Too small, return as-is
+    }
+    
+    // Attributes is at offset 8 (INT16)
+    const attributes = recordBatchData.readInt16BE(8);
+    const compressionType = getCompressionType(attributes);
+    
+    log('debug', `RecordBatch compression type: ${compressionType}`);
+    
+    if (compressionType === COMPRESSION_NONE) {
+      // No compression
+      return recordBatchData;
+    }
+    
+    if (compressionType === COMPRESSION_GZIP) {
+      // GZIP compression - decompress the records section
+      // The records start after the RecordBatch header (61 bytes)
+      const headerSize = 61;
+      if (recordBatchData.length <= headerSize) {
+        return recordBatchData;
+      }
+      
+      const header = recordBatchData.subarray(0, headerSize);
+      const compressedRecords = recordBatchData.subarray(headerSize);
+      
+      try {
+        const decompressed = zlib.gunzipSync(compressedRecords);
+        log('info', `Decompressed GZIP: ${compressedRecords.length} → ${decompressed.length} bytes`);
+        
+        // Rebuild the record batch with decompressed data and updated attributes
+        const newBatch = Buffer.concat([header, decompressed]);
+        
+        // Update attributes to indicate no compression
+        newBatch.writeInt16BE(attributes & 0xFFF8, 8); // Clear compression bits
+        
+        return newBatch;
+      } catch (err) {
+        log('error', `GZIP decompression failed: ${err.message}`);
+        return recordBatchData;
+      }
+    }
+    
+    if (compressionType === COMPRESSION_SNAPPY || compressionType === COMPRESSION_LZ4 || compressionType === COMPRESSION_ZSTD) {
+      log('warn', `Compression type ${compressionType} not supported yet (Snappy/LZ4/ZSTD require external libraries)`);
+      return recordBatchData;
+    }
+    
+    return recordBatchData;
+  } catch (err) {
+    log('error', `Decompression error: ${err.message}`);
+    return recordBatchData;
+  }
+}
+
+function compressRecordBatch(recordBatchData, compressionType = COMPRESSION_GZIP) {
+  try {
+    if (compressionType === COMPRESSION_NONE || recordBatchData.length < 61) {
+      return recordBatchData;
+    }
+    
+    if (compressionType === COMPRESSION_GZIP) {
+      const headerSize = 61;
+      const header = recordBatchData.subarray(0, headerSize);
+      const records = recordBatchData.subarray(headerSize);
+      
+      try {
+        const compressed = zlib.gzipSync(records, { level: 6 });
+        log('info', `Compressed with GZIP: ${records.length} → ${compressed.length} bytes`);
+        
+        // Rebuild batch with compressed data
+        const newBatch = Buffer.concat([header, compressed]);
+        
+        // Update attributes to indicate GZIP compression
+        const attributes = newBatch.readInt16BE(8);
+        newBatch.writeInt16BE((attributes & 0xFFF8) | COMPRESSION_GZIP, 8);
+        
+        return newBatch;
+      } catch (err) {
+        log('error', `GZIP compression failed: ${err.message}`);
+        return recordBatchData;
+      }
+    }
+    
+    return recordBatchData;
+  } catch (err) {
+    log('error', `Compression error: ${err.message}`);
+    return recordBatchData;
+  }
+}
+
 // Helper: Write record batch to partition log file
 function writeRecordBatchToLog(topicName, partitionIndex, recordBatch, baseOffset = 0) {
   const partitionDir = `${LOG_DIR}/${topicName}-${partitionIndex}`;
@@ -1573,11 +1680,14 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
           partition.logAppendTimeMs = -1n;
           partition.logStartOffset = -1n;
         } else if (partition.recordBatch && partition.recordBatch.length > 0) {
-          console.log(`    Writing ${partition.recordBatch.length} bytes to partition log (Leader: ${replicationInfo.leader})`);
+          // Decompress if needed
+          const decompressedBatch = decompressRecordBatch(partition.recordBatch);
+          
+          console.log(`    Writing ${decompressedBatch.length} bytes to partition log (Leader: ${replicationInfo.leader})`);
           const writeSuccess = writeRecordBatchToLog(
             topic.name,
             partition.index,
-            partition.recordBatch,
+            decompressedBatch,
             0  // baseOffset = 0 (first record)
           );
           
