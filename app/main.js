@@ -1741,6 +1741,130 @@ function handleProduce(connection, requestApiVersion, correlationId, data) {
 }
 
 // Handler for ApiVersions API (API key 18)
+// Consumer group health tracking
+const consumerGroups = new Map(); // groupId -> { members: Map<memberId, { lastHeartbeat, generation }> }
+
+// Handle Heartbeat API (API key 12)
+function handleHeartbeat(connection, requestApiVersion, correlationId, data) {
+  log('info', "Handling Heartbeat request");
+  
+  // Parse Heartbeat request (v4)
+  let offset = 12; // Skip messageSize, apiKey, apiVersion, correlationId
+  
+  // Skip client_id (NULLABLE_STRING)
+  const clientIdLength = data.readInt16BE(offset);
+  offset += 2;
+  if (clientIdLength > 0) {
+    offset += clientIdLength;
+  }
+  
+  // Skip TAG_BUFFER
+  offset += 1;
+  
+  // Parse group_id (COMPACT_STRING)
+  const groupIdLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  const groupId = data.toString('utf8', offset, offset + groupIdLength);
+  offset += groupIdLength;
+  
+  // Parse generation_id (INT32)
+  const generationId = data.readInt32BE(offset);
+  offset += 4;
+  
+  // Parse member_id (COMPACT_STRING)
+  const memberIdLength = data.readUInt8(offset) - 1;
+  offset += 1;
+  const memberId = data.toString('utf8', offset, offset + memberIdLength);
+  offset += memberIdLength;
+  
+  // Parse group_instance_id (COMPACT_NULLABLE_STRING) - optional
+  const groupInstanceIdLength = data.readUInt8(offset);
+  offset += 1;
+  let groupInstanceId = null;
+  if (groupInstanceIdLength > 0) {
+    groupInstanceId = data.toString('utf8', offset, offset + groupInstanceIdLength - 1);
+    offset += groupInstanceIdLength - 1;
+  }
+  
+  log('debug', `Heartbeat from group: ${groupId}, member: ${memberId}, generation: ${generationId}`);
+  
+  // Update consumer group state
+  if (!consumerGroups.has(groupId)) {
+    consumerGroups.set(groupId, {
+      members: new Map(),
+      generation: 0
+    });
+  }
+  
+  const group = consumerGroups.get(groupId);
+  
+  // Check if member exists and generation matches
+  let errorCode = 0; // NO_ERROR
+  
+  if (generationId !== group.generation && group.generation !== 0) {
+    errorCode = 22; // ILLEGAL_GENERATION
+    log('warn', `Illegal generation for member ${memberId}: expected ${group.generation}, got ${generationId}`);
+  } else if (memberId && !group.members.has(memberId) && group.members.size > 0) {
+    errorCode = 25; // UNKNOWN_MEMBER_ID
+    log('warn', `Unknown member ${memberId} in group ${groupId}`);
+  } else {
+    // Update heartbeat timestamp
+    group.members.set(memberId, {
+      lastHeartbeat: Date.now(),
+      generation: generationId,
+      groupInstanceId
+    });
+    
+    // Update group generation if needed
+    if (generationId > group.generation) {
+      group.generation = generationId;
+    }
+    
+    log('debug', `Heartbeat accepted for ${memberId} in group ${groupId}`);
+  }
+  
+  // Check for stale members (no heartbeat for >30 seconds)
+  const now = Date.now();
+  const sessionTimeoutMs = 30000;
+  
+  for (const [mid, member] of group.members.entries()) {
+    if (now - member.lastHeartbeat > sessionTimeoutMs) {
+      group.members.delete(mid);
+      log('warn', `Removed stale member ${mid} from group ${groupId}`);
+    }
+  }
+  
+  // Build Heartbeat response
+  const responseBody = Buffer.alloc(8);
+  let bodyOffset = 0;
+  
+  // TAG_BUFFER (response header v1)
+  responseBody.writeUInt8(0, bodyOffset);
+  bodyOffset += 1;
+  
+  // throttle_time_ms (INT32)
+  responseBody.writeInt32BE(0, bodyOffset);
+  bodyOffset += 4;
+  
+  // error_code (INT16)
+  responseBody.writeInt16BE(errorCode, bodyOffset);
+  bodyOffset += 2;
+  
+  // TAG_BUFFER (body)
+  responseBody.writeUInt8(0, bodyOffset);
+  bodyOffset += 1;
+  
+  // Build complete response
+  const messageSize = 4 + responseBody.length;
+  const response = Buffer.alloc(4 + messageSize);
+  response.writeInt32BE(messageSize, 0);
+  response.writeInt32BE(correlationId, 4);
+  responseBody.copy(response, 8);
+  
+  log('debug', `Sending Heartbeat response with error code: ${errorCode}`);
+  connection.write(response);
+}
+
 // Handle Metadata API (API key 3)
 function handleMetadata(connection, requestApiVersion, correlationId, data) {
   log('info', "Handling Metadata request");
@@ -1965,16 +2089,16 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   }
   
   // Build ApiVersions v4 response body
-  // Body size: error_code(2) + array_length(1) + 9*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 71 bytes
-  const responseBody = Buffer.alloc(71);
+  // Body size: error_code(2) + array_length(1) + 10*API_entry(7 each) + throttle_time(4) + TAG_BUFFER(1) = 78 bytes
+  const responseBody = Buffer.alloc(78);
   let offset = 0;
   
   // error_code (INT16): 0
   responseBody.writeInt16BE(0, offset);
   offset += 2;
   
-  // api_keys (COMPACT_ARRAY): 9 entries = 10 in compact encoding
-  responseBody.writeUInt8(10, offset);
+  // api_keys (COMPACT_ARRAY): 10 entries = 11 in compact encoding
+  responseBody.writeUInt8(11, offset);
   offset += 1;
   
   // API key entry 1: Produce (0)
@@ -2007,7 +2131,17 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 4: ApiVersions (18)
+  // API key entry 4: Heartbeat (12)
+  responseBody.writeInt16BE(12, offset);  // api_key
+  offset += 2;
+  responseBody.writeInt16BE(0, offset);  // min_version
+  offset += 2;
+  responseBody.writeInt16BE(4, offset); // max_version
+  offset += 2;
+  responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
+  offset += 1;
+  
+  // API key entry 5: ApiVersions (18)
   responseBody.writeInt16BE(18, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2017,7 +2151,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 5: CreateTopics (19)
+  // API key entry 6: CreateTopics (19)
   responseBody.writeInt16BE(19, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2027,7 +2161,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 6: DeleteTopics (20)
+  // API key entry 7: DeleteTopics (20)
   responseBody.writeInt16BE(20, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2037,7 +2171,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 7: EndTxn (26)
+  // API key entry 8: EndTxn (26)
   responseBody.writeInt16BE(26, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2047,7 +2181,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 8: CreatePartitions (37)
+  // API key entry 9: CreatePartitions (37)
   responseBody.writeInt16BE(37, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -2057,7 +2191,7 @@ function handleApiVersions(connection, requestApiVersion, correlationId) {
   responseBody.writeUInt8(0, offset);    // TAG_BUFFER (empty)
   offset += 1;
   
-  // API key entry 9: DescribeTopicPartitions (75)
+  // API key entry 10: DescribeTopicPartitions (75)
   responseBody.writeInt16BE(75, offset); // api_key
   offset += 2;
   responseBody.writeInt16BE(0, offset);  // min_version
@@ -3007,6 +3141,9 @@ const server = net.createServer((connection) => {
     } else if (requestApiKey === 3) {
       // Metadata API
       handleMetadata(connection, requestApiVersion, correlationId, data);
+    } else if (requestApiKey === 12) {
+      // Heartbeat API
+      handleHeartbeat(connection, requestApiVersion, correlationId, data);
     } else if (requestApiKey === 18) {
       // ApiVersions API
       handleApiVersions(connection, requestApiVersion, correlationId);
